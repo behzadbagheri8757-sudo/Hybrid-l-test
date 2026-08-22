@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>IndexedDB Transaction Rollback Tests</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.25rem; }
+    .pass { color: #0a0; }
+    .fail { color: #c00; font-weight: 600; }
+    .skip { color: #a60; }
+    pre { background: #f4f4f4; padding: 12px; overflow: auto; font-size: 12px; }
+    #summary { font-size: 1.1rem; margin: 16px 0; }
+  </style>
+</head>
+<body>
+  <h1>IndexedDB Transaction Rollback — Chrome/Chromium (proxy for WebKit rules where identical)</h1>
+  <p>
+    Safari-specific runtime is not available in this environment. These tests exercise the
+    same IndexedDB transaction semantics required by the experimental hybrid layer
+    (<code>hybridPutMany</code>: one readwrite transaction, multiple puts).
+  </p>
+  <div id="summary">Running…</div>
+  <pre id="log"></pre>
+  <script>
+(function () {
+  const logEl = document.getElementById('log');
+  const summaryEl = document.getElementById('summary');
+  const lines = [];
+  let passed = 0, failed = 0, skipped = 0;
+
+  function log(msg) {
+    lines.push(msg);
+    logEl.textContent = lines.join('\n');
+  }
+
+  function ok(name) {
+    passed++;
+    log('PASS  ' + name);
+  }
+  function bad(name, err) {
+    failed++;
+    log('FAIL  ' + name + (err ? ' — ' + err : ''));
+  }
+  function skip(name, reason) {
+    skipped++;
+    log('SKIP  ' + name + (reason ? ' — ' + reason : ''));
+  }
+
+  const DB_NAME = 'baqeri_idb_rollback_test_' + Date.now();
+  const STORE = 'collections';
+
+  function openDB() {
+    return new Promise(function (resolve, reject) {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = function (e) {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          db.createObjectStore(STORE, { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = function (e) { resolve(e.target.result); };
+      req.onerror = function (e) { reject(e.target.error); };
+    });
+  }
+
+  function putMany(db, entries) {
+    return new Promise(function (resolve, reject) {
+      if (!entries.length) { resolve(); return; }
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (let i = 0; i < entries.length; i++) {
+        store.put({ key: entries[i].key, value: entries[i].value });
+      }
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function (e) { reject(e.target.error || new Error('tx error')); };
+      tx.onabort = function (e) {
+        reject((e && e.target && e.target.error) || new Error('transaction aborted'));
+      };
+    });
+  }
+
+  function getKey(db, key) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(key);
+      req.onsuccess = function () { resolve(req.result || null); };
+      req.onerror = function (e) { reject(e.target.error); };
+    });
+  }
+
+  function deleteDB(name) {
+    return new Promise(function (resolve) {
+      const req = indexedDB.deleteDatabase(name);
+      req.onsuccess = function () { resolve(); };
+      req.onerror = function () { resolve(); };
+      req.onblocked = function () { resolve(); };
+    });
+  }
+
+  /** Abort transaction after scheduling puts — all puts in that tx must roll back */
+  function putManyThenAbort(db, entries) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (let i = 0; i < entries.length; i++) {
+        store.put({ key: entries[i].key, value: entries[i].value });
+      }
+      // Force abort before complete
+      tx.abort();
+      tx.oncomplete = function () {
+        reject(new Error('unexpected complete after abort'));
+      };
+      tx.onabort = function () {
+        resolve({ aborted: true, error: tx.error });
+      };
+      tx.onerror = function () {
+        // abort also fires error in some engines; still success for our test
+        resolve({ aborted: true, error: tx.error });
+      };
+    });
+  }
+
+  /**
+   * Constraint-style failure: open second transaction that conflicts is hard.
+   * Instead: use a versionchange / invalid put by closing DB mid-flight is flaky.
+   * Test explicit abort + verify prior state.
+   */
+  async function run() {
+    log('DB: ' + DB_NAME);
+    log('UA: ' + navigator.userAgent);
+    log('');
+
+    let db;
+    try {
+      db = await openDB();
+    } catch (e) {
+      bad('openDB', e && e.message);
+      finish();
+      return;
+    }
+
+    // --- Test 1: successful multi-put atomic batch ---
+    try {
+      await putMany(db, [
+        { key: 'payments', value: JSON.stringify([{ id: 'p1', amount: 10 }]) },
+        { key: 'customers', value: JSON.stringify([{ id: 'c1', name: 'A' }]) },
+        { key: '__meta__', value: JSON.stringify({ invoiceSeq: 1001, schemaVersion: 4 }) },
+      ]);
+      const p = await getKey(db, 'payments');
+      const c = await getKey(db, 'customers');
+      const m = await getKey(db, '__meta__');
+      if (!p || !c || !m) throw new Error('missing key after putMany');
+      if (JSON.parse(p.value)[0].id !== 'p1') throw new Error('payments mismatch');
+      if (JSON.parse(c.value)[0].name !== 'A') throw new Error('customers mismatch');
+      ok('multi-put one transaction commits all keys');
+    } catch (e) {
+      bad('multi-put one transaction commits all keys', e && e.message);
+    }
+
+    // --- Test 2: abort rolls back entire batch (nothing new committed) ---
+    try {
+      await putManyThenAbort(db, [
+        { key: 'payments', value: JSON.stringify([{ id: 'SHOULD_NOT_PERSIST', amount: 999 }]) },
+        { key: 'invoices', value: JSON.stringify([{ id: 'inv-ghost' }]) },
+      ]);
+      const p = await getKey(db, 'payments');
+      const inv = await getKey(db, 'invoices');
+      const payments = p ? JSON.parse(p.value) : [];
+      if (payments[0] && payments[0].id === 'SHOULD_NOT_PERSIST') {
+        throw new Error('aborted put was persisted');
+      }
+      if (payments[0] && payments[0].id !== 'p1') {
+        throw new Error('previous payments lost after abort');
+      }
+      if (inv) throw new Error('aborted invoices key appeared');
+      ok('tx.abort() rolls back all puts in the batch; prior state kept');
+    } catch (e) {
+      bad('tx.abort() rolls back all puts in the batch; prior state kept', e && e.message);
+    }
+
+    // --- Test 3: after abort, a new successful tx can update ---
+    try {
+      await putMany(db, [
+        { key: 'payments', value: JSON.stringify([{ id: 'p2', amount: 20 }]) },
+      ]);
+      const p = await getKey(db, 'payments');
+      if (JSON.parse(p.value)[0].id !== 'p2') throw new Error('update after abort failed');
+      ok('new transaction after abort commits correctly');
+    } catch (e) {
+      bad('new transaction after abort commits correctly', e && e.message);
+    }
+
+    // --- Test 4: hybrid-shaped failure path — onerror/onabort does not leave partial keys ---
+    // Simulate: seed three keys, then abort a tx that would overwrite two and add one
+    try {
+      await putMany(db, [
+        { key: 'products', value: JSON.stringify([{ id: 'pr1', stockQty: 5 }]) },
+        { key: 'inventoryLayers', value: JSON.stringify([{ id: 'L1', qtyRemaining: 5 }]) },
+      ]);
+      await putManyThenAbort(db, [
+        { key: 'products', value: JSON.stringify([{ id: 'pr1', stockQty: 0 }]) },
+        { key: 'inventoryLayers', value: JSON.stringify([]) },
+        { key: 'invoices', value: JSON.stringify([{ id: 'partial' }]) },
+      ]);
+      const pr = JSON.parse((await getKey(db, 'products')).value);
+      const layers = JSON.parse((await getKey(db, 'inventoryLayers')).value);
+      const inv = await getKey(db, 'invoices');
+      if (pr[0].stockQty !== 5) throw new Error('products partially updated after abort');
+      if (layers[0].qtyRemaining !== 5) throw new Error('layers partially updated after abort');
+      if (inv) throw new Error('new invoices key from aborted tx leaked');
+      ok('abort leaves no partial multi-collection state');
+    } catch (e) {
+      bad('abort leaves no partial multi-collection state', e && e.message);
+    }
+
+    // --- Test 5: request error aborts transaction (ConstraintError style) ---
+    // Use out-of-line keyPath store already — put without keyPath field fails if we used autoIncrement.
+    // For keyPath:'key', put({}) without key throws DataError and aborts tx.
+    try {
+      const before = await getKey(db, 'payments');
+      await new Promise(function (resolve, reject) {
+        const tx = db.transaction(STORE, 'readwrite');
+        const store = tx.objectStore(STORE);
+        // Valid put first in same tx
+        store.put({ key: 'payments', value: JSON.stringify([{ id: 'SHOULD_ROLLBACK', amount: 1 }]) });
+        // Invalid put: missing keyPath 'key' → DataError → transaction abort
+        try {
+          store.put({ value: 'no-key' });
+        } catch (syncErr) {
+          // Some browsers throw synchronously on put
+          try { tx.abort(); } catch (e2) {}
+        }
+        tx.oncomplete = function () {
+          reject(new Error('tx completed despite invalid put'));
+        };
+        tx.onabort = function () { resolve(); };
+        tx.onerror = function () { /* expect */ };
+      });
+      const after = await getKey(db, 'payments');
+      const id = after ? JSON.parse(after.value)[0].id : null;
+      if (id === 'SHOULD_ROLLBACK') {
+        throw new Error('invalid request did not roll back earlier put in same tx');
+      }
+      // Should still be p2 from test 3
+      if (id !== 'p2') throw new Error('unexpected payments id after error: ' + id);
+      ok('error in one request aborts whole transaction (no partial commit)');
+    } catch (e) {
+      bad('error in one request aborts whole transaction (no partial commit)', e && e.message);
+    }
+
+    // --- Test 6: readonly tx cannot put ---
+    try {
+      await new Promise(function (resolve, reject) {
+        const tx = db.transaction(STORE, 'readonly');
+        let syncThrow = false;
+        try {
+          tx.objectStore(STORE).put({ key: 'x', value: 'y' });
+        } catch (e) {
+          syncThrow = true;
+        }
+        tx.oncomplete = function () {
+          if (syncThrow) resolve();
+          else reject(new Error('readonly put did not fail'));
+        };
+        tx.onerror = function () { resolve(); };
+        tx.onabort = function () { resolve(); };
+      });
+      ok('readonly transaction rejects mutations');
+    } catch (e) {
+      bad('readonly transaction rejects mutations', e && e.message);
+    }
+
+    try { db.close(); } catch (e) {}
+    await deleteDB(DB_NAME);
+    log('');
+    log('Database deleted: ' + DB_NAME);
+    finish();
+  }
+
+  function finish() {
+    const text = 'RESULT: ' + passed + ' PASS, ' + failed + ' FAIL, ' + skipped + ' SKIP';
+    summaryEl.innerHTML = failed
+      ? '<span class="fail">' + text + '</span>'
+      : '<span class="pass">' + text + '</span>';
+    log('');
+    log(text);
+    // Machine-readable marker for headless scrape
+    log('__TEST_COMPLETE__');
+    document.title = failed ? 'FAIL ' + failed : 'PASS ' + passed;
+  }
+
+  if (!('indexedDB' in window)) {
+    bad('indexedDB available', 'not present');
+    finish();
+  } else {
+    run().catch(function (e) {
+      bad('run()', e && e.message);
+      finish();
+    });
+  }
+})();
+  </script>
+</body>
+</html>
