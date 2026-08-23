@@ -473,21 +473,21 @@ async function run() {
     assert.strictEqual(globalThis.saveData, originalSave);
   });
 
-  // ---- wiring status self-check (opt-in only; no silent install) ----
-  await test('W1: hybrid scripts present but install is opt-in only', async function () {
+  // ---- wiring status self-check: Hybrid is default-on and fail-closed ----
+  await test('W1: Hybrid boot is default-on; legacy query remains compatible', async function () {
     const fs = require('fs');
     const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
     const boot = fs.readFileSync(path.join(__dirname, '..', 'js', 'experimental-hybrid-boot.js'), 'utf8');
-    assert.ok(html.indexOf('db.js') !== -1, 'monolith db.js referenced');
-    assert.ok(html.indexOf('db-hybrid.js') !== -1, 'db-hybrid loaded for experimental repo');
-    assert.ok(html.indexOf('persist-commit.js') !== -1, 'persist-commit loaded for experimental repo');
-    assert.ok(html.indexOf('experimental-hybrid-boot.js') !== -1, 'opt-in boot script referenced');
-    assert.ok(boot.indexOf('isHybridOptIn') !== -1, 'opt-in gate present');
-    assert.ok(boot.indexOf('installExperimentalPersist') !== -1, 'install path present');
-    assert.ok(
-      boot.indexOf('if (!isHybridOptIn())') !== -1 || boot.indexOf('if(!isHybridOptIn())') !== -1,
-      'install skipped when opt-in off'
-    );
+    const nav = fs.readFileSync(path.join(__dirname, '..', 'js', 'nav.js'), 'utf8');
+    assert.ok(html.indexOf('db.js') !== -1, 'legacy db.js remains available for migration');
+    assert.ok(html.indexOf('db-hybrid.js') !== -1, 'Hybrid DB loaded');
+    assert.ok(html.indexOf('persist-commit.js') !== -1, 'Hybrid persistence commit loaded');
+    assert.ok(html.indexOf('experimental-hybrid-boot.js') !== -1, 'Hybrid boot script referenced');
+    assert.ok(boot.indexOf('function isHybridOptIn()') !== -1, 'legacy activation API retained');
+    assert.ok(boot.indexOf('return true;') !== -1, 'Hybrid default-on');
+    assert.ok(boot.indexOf('global.BaqeriExperimentalHybridBoot.ready = maybeInstallExperimentalHybrid();') !== -1, 'Hybrid boot runs without query parameter');
+    assert.ok(boot.indexOf('return false;') === -1, 'boot does not silently disable Hybrid');
+    assert.ok(nav.indexOf('if (hybridReady !== true)') !== -1, 'SPA boot fails closed when Hybrid is not ready');
   });
 
   console.log('\n=== FINAL VALIDATION: ' + passed + ' PASS, ' + failed + ' FAIL ===\n');
