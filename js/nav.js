@@ -370,7 +370,7 @@ async function bootPage(activeId, afterLoad){
     }
     if (window.BaqeriExperimentalHybridBoot && window.BaqeriExperimentalHybridBoot.ready) {
       var hybridReady = await window.BaqeriExperimentalHybridBoot.ready;
-      if (window.BaqeriExperimentalHybridBoot.isHybridOptIn() && hybridReady !== true) {
+      if (hybridReady !== true) {
         throw new Error('Hybrid persistence failed to initialize; refusing monolithic fallback');
       }
     }
@@ -433,7 +433,7 @@ async function bootSpaShell() {
 
     if (window.BaqeriExperimentalHybridBoot && window.BaqeriExperimentalHybridBoot.ready) {
       var hybridReady = await window.BaqeriExperimentalHybridBoot.ready;
-      if (window.BaqeriExperimentalHybridBoot.isHybridOptIn() && hybridReady !== true) {
+      if (hybridReady !== true) {
         throw new Error('Hybrid persistence failed to initialize; refusing monolithic fallback');
       }
     }

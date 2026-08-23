@@ -1,30 +1,19 @@
 /* experimental-hybrid-boot.js
  *
- * EXPERIMENTAL / OPT-IN ONLY — does nothing unless explicitly enabled.
+ * Hybrid persistence is enabled by default.
+ * The legacy ?hybrid=1 / ?experimentalHybrid=1 parameters are retained for
+ * backward compatibility but no longer control activation.
  *
- * Enable Hybrid persistence:
- *   1. URL query:  ?hybrid=1
- *   2. or localStorage: localStorage.setItem('baqeriExperimentalHybrid', '1')
- *
- * When disabled (default): SPA uses production-style js/db.js saveData (monolith blob).
- * When enabled: replaces global saveData via BaqeriPersistCommit.installExperimentalPersist()
- *               and uses baqeriDB_experimental (separate from production DB name).
- *
- * NEVER enable this in Production Freeze builds.
+ * Hybrid initialization is fail-closed: initialization failure never falls
+ * back silently to the monolithic persistence path.
  */
 (function (global) {
   'use strict';
 
   function isHybridOptIn() {
-    try {
-      var q = (global.location && global.location.search) || '';
-      if (/[?&]hybrid=1(?:&|$)/.test(q)) return true;
-      if (/[?&]experimentalHybrid=1(?:&|$)/.test(q)) return true;
-      if (global.localStorage && global.localStorage.getItem('baqeriExperimentalHybrid') === '1') {
-        return true;
-      }
-    } catch (e) { /* private mode etc. */ }
-    return false;
+    // Legacy activation parameters are intentionally accepted but no longer
+    // required: Hybrid is always enabled.
+    return true;
   }
 
   function banner(msg) {
@@ -36,20 +25,15 @@
   /**
    * Call after db-hybrid.js + persist-commit.js are loaded, and ideally
    * before the first loadData/saveData during app boot.
-   * Safe no-op when opt-in is off or modules missing.
+   * Hybrid is always required; missing modules or initialization failures throw
+   * so callers can fail closed instead of falling back to monolithic persistence.
    */
   async function maybeInstallExperimentalHybrid() {
-    if (!isHybridOptIn()) {
-      banner('opt-in OFF — using monolithic db.js (default)');
-      return false;
-    }
     if (!global.BaqeriHybrid) {
-      banner('opt-in ON but BaqeriHybrid missing — load js/db-hybrid.js first');
-      return false;
+      throw new Error('Hybrid persistence unavailable: load js/db-hybrid.js first');
     }
     if (!global.BaqeriPersistCommit) {
-      banner('opt-in ON but BaqeriPersistCommit missing — load js/persist-commit.js first');
-      return false;
+      throw new Error('Hybrid persistence unavailable: load js/persist-commit.js first');
     }
     try {
       const H = global.BaqeriHybrid;
@@ -90,7 +74,7 @@
       return true;
     } catch (e) {
       banner('install failed: ' + (e && e.message ? e.message : e));
-      return false;
+      throw e;
     }
   }
 
@@ -100,12 +84,7 @@
     isReadOnly: function(){ return global.BaqeriExperimentalHybridReadOnly === true; },
   };
 
-  // Auto-run install when this script loads (only if opt-in).
-  // Boot is async; nav.js waits on this promise before the first loadData().
-  global.BaqeriExperimentalHybridBoot.ready = isHybridOptIn()
-    ? maybeInstallExperimentalHybrid()
-    : Promise.resolve(false);
-  if (!isHybridOptIn()) {
-    banner('opt-in OFF — monolithic persistence');
-  }
+  // Auto-run install on every boot. nav.js waits on this promise before the
+  // first loadData(); a rejection is handled as a fail-closed boot failure.
+  global.BaqeriExperimentalHybridBoot.ready = maybeInstallExperimentalHybrid();
 })(typeof window !== 'undefined' ? window : globalThis);
