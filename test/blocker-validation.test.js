@@ -18,7 +18,7 @@ function test(name, fn){
 }
 function validBackup(){
   return {
-    schemaVersion:3, invoiceSeq:1001,
+    backupVersion:2, schemaVersion:3, invoiceSeq:1001,
     products:[{id:'pr1',name:'عدس',category:'حبوبات',packageWeight:1,buy:100,wholesale:120,retail:150,sell:150,stockQty:10,minStock:2,priceHistory:[],stockLog:[],active:true}],
     customers:[{id:'c1',name:'فروشگاه',ownerName:'علی',phone:'1',address:'a',region:'رویان',route:'شرق',note:'',openingBalance:0,visits:[],active:true}],
     invoices:[{id:'i1',number:1001,customerId:'c1',date:'2026-08-23',items:[{productId:'pr1',name:'عدس',qty:1,price:150,buyPrice:100,discount:0,weight:1}],total:150,discount:0,cashPaid:150,checkPaid:0,cardPaid:0,transferPaid:0,editHistory:[]}],
@@ -26,7 +26,7 @@ function validBackup(){
     checks:[{id:'ch1',customerId:'c1',amount:0,dueDate:'2026-08-23',checkNumber:'',status:'pending'}],
     suppliers:[{id:'s1',name:'تامین',phone:'',openingBalance:0,active:true,purchases:[],payments:[]}],
     inventoryLayers:[{id:'L1',purchaseId:null,productId:'pr1',itemId:null,qtyOriginal:10,qtyRemaining:9,unitCost:100,status:'open',source:'purchase',date:'2026-08-23',note:''}],
-    prospectScout:{version:1,shops:[],routes:[],dailyTarget:5}
+    prospectScout:{version:1,shops:[],routes:[],dailyTarget:{date:'2026-08-23',target:5,count:2,hit:{'50':true},lastMsg:{}}}
   };
 }
 
@@ -66,6 +66,25 @@ class FakeDB {
   await test('malformed backup: unknown top-level field rejected',()=>{const x=validBackup();x.evil='overwrite';assert.throws(()=>validateBackupDeep(x));});
   await test('malformed backup: unknown nested field rejected',()=>{const x=validBackup();x.inventoryLayers[0].evil='overwrite';assert.throws(()=>validateBackupDeep(x));});
   await test('valid backup round-trip validation passes',()=>{const x=JSON.parse(JSON.stringify(validBackup()));assert.strictEqual(validateBackupDeep(x),true);});
+
+
+  await test('real ProspectScout dailyTarget object validates',()=>{
+    const x=validBackup(); assert.strictEqual(validateBackupDeep(x),true);
+  });
+  await test('legacy backup without backupVersion, inventoryLayers or ProspectScout validates',()=>{
+    const x=validBackup(); delete x.backupVersion; x.schemaVersion=3; delete x.inventoryLayers; delete x.prospectScout;
+    assert.strictEqual(validateBackupDeep(x),true);
+  });
+  await test('legacy numeric ProspectScout dailyTarget validates',()=>{
+    const x=validBackup(); x.prospectScout.dailyTarget=5;
+    assert.strictEqual(validateBackupDeep(x),true);
+  });
+  await test('current backup missing ProspectScout is rejected',()=>{
+    const x=validBackup(); delete x.prospectScout; assert.throws(()=>validateBackupDeep(x));
+  });
+  await test('current backup missing inventoryLayers is rejected',()=>{
+    const x=validBackup(); delete x.inventoryLayers; assert.throws(()=>validateBackupDeep(x));
+  });
 
   await test('single-writer owner blocks stale writer',async()=>{
     await H.releaseHybridOwner(); H.memoryClear(); await H.acquireHybridOwner();
