@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fa" dir="rtl" data-spa-shell="1" data-experimental-repo="baqeri-hybrid-experimental">
+<html lang="fa" dir="rtl" data-spa-shell="1">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -9,9 +9,9 @@
 <link rel="manifest" href="./manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="باقری-آزمایشی">
+<meta name="apple-mobile-web-app-title" content="باقری">
 <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
-<title>باقری — Experimental Hybrid (نه Production)</title>
+<title>باقری — دفتر حساب</title>
 <script src="./vendor/xlsx.full.min.js"></script>
 <script src="./vendor/html2canvas.min.js"></script>
 <link rel="stylesheet" href="./css/app.css">
@@ -20,19 +20,12 @@
 .report-section h3{font-size:1rem;margin:0 0 10px;font-weight:800;}
 .report-note{font-size:.75rem;color:var(--ink-soft);margin:6px 0 0;line-height:1.5;}
 .debt-row a{text-decoration:none;color:inherit;}
-/* Experimental banner */
-#exp-banner{background:#4a2800;color:#ffd59a;text-align:center;padding:6px 10px;font-size:12px;font-weight:700;}
-#exp-banner code{background:rgba(0,0,0,.25);padding:1px 6px;border-radius:4px;}
 </style>
 </head>
 <body class="page-dashboard">
-<div id="exp-banner">
-  EXPERIMENTAL REPO — Hybrid persistence is OFF by default.
-  Enable with <code>?hybrid=1</code> · See README.md · Not Production Freeze
-</div>
 <header>
   <h1>حبوبات و خشکبار باقری</h1>
-  <p>دفتر حساب — نسخه آزمایشی Hybrid (مستقل از Production)</p>
+  <p>دفتر حساب</p>
 </header>
 <nav id="nav"></nav>
 <main id="main"></main>
@@ -44,19 +37,9 @@
 <script src="./js/models.js"></script>
 <script src="./js/ui.js"></script>
 <script src="./js/db.js"></script>
-<!--
-  EXPERIMENTAL HYBRID (opt-in). Loaded always but inert unless ?hybrid=1
-  or localStorage baqeriExperimentalHybrid=1. Does not touch Production DB name
-  when enabled (uses baqeriDB_experimental).
--->
 <script src="./js/db-hybrid.js"></script>
 <script src="./js/persist-commit.js"></script>
 <script src="./js/experimental-hybrid-boot.js"></script>
-<!--
-  REQUIRED FROM PRODUCTION FREEZE — currently ABSENT in this package (see MISSING_FILES.md):
-  js/stock.js | js/payments.js (core) | js/router.js | js/prospect-scoring.js
-  SPA will not fully boot until these are copied from Production Freeze.
--->
 <script src="./js/stock.js"></script>
 <script src="./js/payments.js"></script>
 <script src="./js/calc.js"></script>
@@ -89,20 +72,10 @@
 <script src="./js/views/settings.js"></script>
 
 <script>
-/* SPA shell — requires router.js + stock.js + core payments.js (see MISSING_FILES.md) */
 if (typeof bootSpaShell === 'function') {
   bootSpaShell();
 } else {
-  console.error('[Experimental] bootSpaShell missing — restore js/router.js / nav.js from Production Freeze');
-  var m = document.getElementById('main');
-  if (m) {
-    m.innerHTML = '<div style="padding:24px;line-height:1.7">' +
-      '<h2>فایل‌های ناقص</h2>' +
-      '<p>این مخزن آزمایشی است. برای boot کامل SPA این فایل‌ها را از Production Freeze کپی کنید:</p>' +
-      '<ul><li><code>js/stock.js</code></li><li><code>js/payments.js</code> (هسته)</li>' +
-      '<li><code>js/router.js</code></li><li><code>js/prospect-scoring.js</code></li></ul>' +
-      '<p>تست‌های Hybrid بدون SPA قابل اجرا هستند — README.md</p></div>';
-  }
+  console.error('SPA boot failed: bootSpaShell is unavailable');
 }
 </script>
 <script src="./js/sw-register.js"></script>
