@@ -156,10 +156,22 @@ function assertIdObject(o, path){ assertString(o.id, path+'.id', true); }
 
 function validateBackupDeep(parsed){
   if(!parsed || typeof parsed!=='object' || Array.isArray(parsed)) throw new Error('backup root must be object');
-  const topAllowed = new Set(['schemaVersion','invoiceSeq','products','customers','invoices','payments','checks','suppliers','inventoryLayers','prospectScout']);
+  const topAllowed = new Set(['backupVersion','schemaVersion','invoiceSeq','products','customers','invoices','payments','checks','suppliers','inventoryLayers','prospectScout']);
   assertKnownKeys(parsed, topAllowed, 'backup');
-  for(const k of ['products','customers','invoices','payments','checks','suppliers','inventoryLayers']) assertArray(parsed[k], k);
-  if(parsed.schemaVersion!=null) assertNumber(parsed.schemaVersion,'schemaVersion',false);
+  const isCurrentBackup = parsed.backupVersion != null;
+  if(isCurrentBackup){
+    assertNumber(parsed.backupVersion,'backupVersion',true);
+    if(parsed.backupVersion !== 2) throw new Error('unsupported backupVersion');
+  }
+  const schemaVersion = parsed.schemaVersion == null ? 1 : parsed.schemaVersion;
+  assertNumber(schemaVersion,'schemaVersion',true);
+  if(!Number.isInteger(schemaVersion) || schemaVersion < 1 || schemaVersion > (typeof CURRENT_SCHEMA_VERSION === 'number' ? CURRENT_SCHEMA_VERSION : 3)) throw new Error('unsupported backup schemaVersion');
+  const currentSchemaVersion = (typeof CURRENT_SCHEMA_VERSION === 'number' ? CURRENT_SCHEMA_VERSION : 3);
+  const legacyBackup = !isCurrentBackup && schemaVersion < currentSchemaVersion;
+  const requiresFullProspect = isCurrentBackup;
+  for(const k of ['products','customers','invoices','payments','checks','suppliers']) assertArray(parsed[k], k);
+  if(requiresFullProspect) assertArray(parsed.inventoryLayers, 'inventoryLayers');
+  else if(parsed.inventoryLayers != null) assertArray(parsed.inventoryLayers, 'inventoryLayers');
   if(parsed.invoiceSeq!=null) assertNumber(parsed.invoiceSeq,'invoiceSeq',false);
 
   parsed.products.forEach((p,i)=>{
@@ -190,14 +202,24 @@ function validateBackupDeep(parsed){
     s.purchases.forEach((pu,j)=>{ const q=path+'.purchases['+j+']'; assertKnownKeys(pu,new Set(['id','date','amount','desc','productId','qty','items','returns']),q); assertIdObject(pu,q); assertString(pu.date,q+'.date',true); assertNumber(pu.amount,q+'.amount',true); assertString(pu.desc,q+'.desc',true); assertString(pu.productId,q+'.productId',true); assertNumber(pu.qty,q+'.qty',true); if(pu.items!=null){ assertArray(pu.items,q+'.items'); pu.items.forEach((it,z)=>{ const r=q+'.items['+z+']'; assertKnownKeys(it,new Set(['id','productId','name','qty','unitCost','lineAmount']),r); assertIdObject(it,r); assertString(it.productId,r+'.productId',true); assertString(it.name,r+'.name',true); for(const k of ['qty','unitCost','lineAmount']) assertNumber(it[k],r+'.'+k,true); }); } assertArray(pu.returns,q+'.returns'); pu.returns.forEach((ret,z)=>{ const r=q+'.returns['+z+']'; assertKnownKeys(ret,new Set(['id','date','qty','amount','items']),r); assertIdObject(ret,r); assertString(ret.date,r+'.date',true); assertNumber(ret.qty,r+'.qty',true); assertNumber(ret.amount,r+'.amount',true); if(ret.items!=null){ assertArray(ret.items,r+'.items'); ret.items.forEach((x,w)=>{ const t=r+'.items['+w+']'; assertKnownKeys(x,new Set(['itemId','productId','qty','amount']),t); if(x.itemId!=null) assertString(x.itemId,t+'.itemId',false); assertString(x.productId,t+'.productId',true); assertNumber(x.qty,t+'.qty',true); assertNumber(x.amount,t+'.amount',true); }); } }); });
     s.payments.forEach((pay,j)=>{ const q=path+'.payments['+j+']'; if(!pay || typeof pay!=='object' || Array.isArray(pay)) throw new Error(q+' must be object'); assertKnownKeys(pay,new Set(['id','date','amount','method','note','faceAmount','checkNumber','bank','issueDate','dueDate','status']),q); if(pay.id!=null) assertString(pay.id,q+'.id',false); assertString(pay.date,q+'.date',true); assertNumber(pay.amount,q+'.amount',true); if(pay.method!=null) assertString(pay.method,q+'.method',false); for(const k of ['note','checkNumber','bank','issueDate','dueDate','status']) if(pay[k]!=null) assertString(pay[k],q+'.'+k,false); if(pay.faceAmount!=null) assertNumber(pay.faceAmount,q+'.faceAmount',false); });
   });
-  parsed.inventoryLayers.forEach((l,i)=>{ const path='inventoryLayers['+i+']'; assertKnownKeys(l,new Set(['id','purchaseId','productId','itemId','qtyOriginal','qtyRemaining','unitCost','status','source','date','note']),path); assertIdObject(l,path); if(l.purchaseId!=null) assertString(l.purchaseId,path+'.purchaseId',false); assertString(l.productId,path+'.productId',true); if(l.itemId!=null) assertString(l.itemId,path+'.itemId',false); for(const k of ['qtyOriginal','qtyRemaining','unitCost']) assertNumber(l[k],path+'.'+k,true); assertString(l.status,path+'.status',true); assertString(l.source,path+'.source',true); if(l.date!=null) assertString(l.date,path+'.date',false); if(l.note!=null) assertString(l.note,path+'.note',false); });
+  (parsed.inventoryLayers||[]).forEach((l,i)=>{ const path='inventoryLayers['+i+']'; assertKnownKeys(l,new Set(['id','purchaseId','productId','itemId','qtyOriginal','qtyRemaining','unitCost','status','source','date','note']),path); assertIdObject(l,path); if(l.purchaseId!=null) assertString(l.purchaseId,path+'.purchaseId',false); assertString(l.productId,path+'.productId',true); if(l.itemId!=null) assertString(l.itemId,path+'.itemId',false); for(const k of ['qtyOriginal','qtyRemaining','unitCost']) assertNumber(l[k],path+'.'+k,true); assertString(l.status,path+'.status',true); assertString(l.source,path+'.source',true); if(l.date!=null) assertString(l.date,path+'.date',false); if(l.note!=null) assertString(l.note,path+'.note',false); });
 
   if(parsed.prospectScout!=null){
     const b=parsed.prospectScout; assertKnownKeys(b,new Set(['version','shops','routes','dailyTarget']),'prospectScout'); if(b.version!==1) throw new Error('prospectScout.version invalid'); assertArray(b.shops,'prospectScout.shops'); assertArray(b.routes,'prospectScout.routes');
     b.shops.forEach((sh,i)=>{ const q='prospectScout.shops['+i+']'; assertKnownKeys(sh,new Set(['id','schemaVersion','name','routeId','neighborhoodId','status','linkedCustomerId','createdAt','updatedAt','latestScore','latestRank','visits']),q); assertIdObject(sh,q); assertNumber(sh.schemaVersion,q+'.schemaVersion',true); assertString(sh.name,q+'.name',true); for(const k of ['routeId','neighborhoodId','linkedCustomerId']) if(sh[k]!=null) assertString(sh[k],q+'.'+k,false); assertString(sh.status,q+'.status',true); assertString(sh.createdAt,q+'.createdAt',true); assertString(sh.updatedAt,q+'.updatedAt',true); assertNumber(sh.latestScore,q+'.latestScore',true); assertString(sh.latestRank,q+'.latestRank',true); assertArray(sh.visits,q+'.visits'); sh.visits.forEach((v,j)=>{ const r=q+'.visits['+j+']'; assertKnownKeys(v,new Set(['id','date','answers','score','rank','scoringVersion','tags']),r); assertIdObject(v,r); assertString(v.date,r+'.date',true); if(!v.answers || typeof v.answers!=='object' || Array.isArray(v.answers)) throw new Error(r+'.answers must be object'); assertNumber(v.score,r+'.score',true); assertString(v.rank,r+'.rank',true); assertNumber(v.scoringVersion,r+'.scoringVersion',true); assertArray(v.tags,r+'.tags'); v.tags.forEach((t,z)=>assertString(t,r+'.tags['+z+']',true)); }); });
     b.routes.forEach((rt,i)=>{ const q='prospectScout.routes['+i+']'; assertKnownKeys(rt,new Set(['id','schemaVersion','name','createdAt','neighborhoods']),q); assertIdObject(rt,q); assertNumber(rt.schemaVersion,q+'.schemaVersion',true); assertString(rt.name,q+'.name',true); assertString(rt.createdAt,q+'.createdAt',true); assertArray(rt.neighborhoods,q+'.neighborhoods'); rt.neighborhoods.forEach((n,j)=>{ const r=q+'.neighborhoods['+j+']'; assertKnownKeys(n,new Set(['id','name']),r); assertIdObject(n,r); assertString(n.name,r+'.name',true); }); });
-    if(b.dailyTarget!=null) assertNumber(b.dailyTarget,'prospectScout.dailyTarget',false);
-  } else throw new Error('prospectScout bundle missing — Full Backup requires both databases');
+    if(b.dailyTarget!=null){
+      if(typeof b.dailyTarget==='number'){ assertNumber(b.dailyTarget,'prospectScout.dailyTarget',false); }
+      else {
+        assertKnownKeys(b.dailyTarget,new Set(['date','target','count','hit','lastMsg']),'prospectScout.dailyTarget');
+        assertString(b.dailyTarget.date,'prospectScout.dailyTarget.date',true);
+        assertNumber(b.dailyTarget.target,'prospectScout.dailyTarget.target',true);
+        assertNumber(b.dailyTarget.count,'prospectScout.dailyTarget.count',true);
+        if(b.dailyTarget.hit==null || typeof b.dailyTarget.hit!=='object' || Array.isArray(b.dailyTarget.hit)) throw new Error('prospectScout.dailyTarget.hit must be object');
+        if(b.dailyTarget.lastMsg==null || typeof b.dailyTarget.lastMsg!=='object' || Array.isArray(b.dailyTarget.lastMsg)) throw new Error('prospectScout.dailyTarget.lastMsg must be object');
+      }
+    }
+  } else if(requiresFullProspect) throw new Error('prospectScout bundle missing — Full Backup requires both databases');
   return true;
 }
 
@@ -231,6 +253,7 @@ async function crmPersistenceDelete(key) {
 async function exportBackupJSON(){
   const stamp = todayISO();
   const payload = JSON.parse(JSON.stringify(data));
+  payload.backupVersion = 2;
   const prospect = await exportProspectScoutBundle();
   if(!prospect) throw new Error('ProspectScout backup unavailable');
   payload.prospectScout = prospect;
@@ -242,12 +265,21 @@ async function exportBackupJSON(){
 async function restoreCrmAndProspectAtomically(previousData, previousProspect, parsed){
   let crmChanged = false;
   let prospectChanged = false;
+  const hasProspect = !!parsed.prospectScout;
   try{
     data = normalizeData(parsed);
     await saveData();
     crmChanged = true;
-    await restoreProspectScoutBundle(parsed.prospectScout);
-    prospectChanged = true;
+    if(hasProspect){
+      const prospectTarget = JSON.parse(JSON.stringify(parsed.prospectScout));
+      // Legacy ProspectScout backups stored dailyTarget as a numeric target.
+      // Convert that legacy scalar to the current durable dailyTarget record.
+      if(typeof prospectTarget.dailyTarget === 'number'){
+        prospectTarget.dailyTarget = {date: todayISO(), target: prospectTarget.dailyTarget, count:0, hit:{}, lastMsg:{}};
+      }
+      await restoreProspectScoutBundle(prospectTarget);
+      prospectChanged = true;
+    }
   }catch(e){
     // Compensating rollback across the two independent IndexedDB databases.
     // Each side is atomic internally; cross-DB consistency is restored by
@@ -275,7 +307,7 @@ async function importBackupJSON(file){
     await crmPersistencePut(PRERESTORE_PROSPECT_KEY, JSON.stringify(previousProspect));
     await restoreCrmAndProspectAtomically(previousData, previousProspect, parsed);
     render();
-    showToast('اطلاعات CRM و ProspectScout با موفقیت بازیابی شد');
+    showToast(parsed.prospectScout ? 'اطلاعات CRM و ProspectScout با موفقیت بازیابی شد' : 'اطلاعات CRM با موفقیت بازیابی شد؛ این بکاپ قدیمی ProspectScout ندارد');
   }catch(e){
     console.error(e);
     showToast('بازیابی انجام نشد؛ اطلاعات قبلی حفظ شد');
