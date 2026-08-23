@@ -38,7 +38,7 @@
    * before the first loadData/saveData during app boot.
    * Safe no-op when opt-in is off or modules missing.
    */
-  function maybeInstallExperimentalHybrid() {
+  async function maybeInstallExperimentalHybrid() {
     if (!isHybridOptIn()) {
       banner('opt-in OFF — using monolithic db.js (default)');
       return false;
@@ -52,13 +52,41 @@
       return false;
     }
     try {
-      global.BaqeriPersistCommit.installExperimentalPersist();
-      banner('ENABLED — saveData → hybrid collections (DB: ' +
-        (global.BaqeriHybrid.HYBRID_DB_NAME || 'baqeriDB_experimental') + ')');
-      // Optional: replace loadData for hybrid stores (caller may still use monolith load)
-      if (typeof global.BaqeriPersistCommit.loadDataHybridAware === 'function') {
-        global.loadDataHybridExperimental = global.BaqeriPersistCommit.loadDataHybridAware;
+      const H = global.BaqeriHybrid;
+      const C = global.BaqeriPersistCommit;
+
+      // Hybrid is single-writer. A second tab may read, but it must never be
+      // allowed to persist a stale RAM snapshot over the current owner.
+      const ownsPersistence = await H.acquireHybridOwner();
+      if (!ownsPersistence) {
+        global.BaqeriExperimentalHybridReadOnly = true;
+        banner('SECOND INSTANCE — read-only mode; Hybrid writes are blocked');
+      } else {
+        global.BaqeriExperimentalHybridReadOnly = false;
       }
+
+      // First activation: migrate the existing monolithic snapshot exactly once.
+      // Existing Hybrid data is authoritative; never silently fall back to monolith.
+      const hasHybrid = await H.hybridHasAnyData();
+      if (!hasHybrid) {
+        let source = null;
+        if (typeof global.dbGet === 'function') {
+          const rec = await global.dbGet('main');
+          if (rec && rec.value) source = JSON.parse(rec.value);
+        }
+        if (!source && typeof global.data !== 'undefined') source = global.data;
+        if (typeof global.normalizeData === 'function') source = global.normalizeData(source || global.emptyData());
+        await H.migrateFromMonolithPayload(source || global.data);
+        banner('first activation — monolith snapshot migrated to Hybrid DB');
+      }
+
+      C.installExperimentalPersist();
+      // installExperimentalPersist replaces both saveData and loadData.
+      // Fail closed if the Hybrid store is incomplete/corrupt.
+      await C.loadDataHybridAware();
+
+      banner('ENABLED — load/save/backup use Hybrid collections (DB: ' +
+        (H.HYBRID_DB_NAME || 'baqeriDB_experimental') + ')');
       return true;
     } catch (e) {
       banner('install failed: ' + (e && e.message ? e.message : e));
@@ -69,13 +97,15 @@
   global.BaqeriExperimentalHybridBoot = {
     isHybridOptIn: isHybridOptIn,
     maybeInstallExperimentalHybrid: maybeInstallExperimentalHybrid,
+    isReadOnly: function(){ return global.BaqeriExperimentalHybridReadOnly === true; },
   };
 
   // Auto-run install when this script loads (only if opt-in).
-  // Scripts must be ordered: db-hybrid → persist-commit → experimental-hybrid-boot
-  if (isHybridOptIn()) {
-    maybeInstallExperimentalHybrid();
-  } else {
+  // Boot is async; nav.js waits on this promise before the first loadData().
+  global.BaqeriExperimentalHybridBoot.ready = isHybridOptIn()
+    ? maybeInstallExperimentalHybrid()
+    : Promise.resolve(false);
+  if (!isHybridOptIn()) {
     banner('opt-in OFF — monolithic persistence');
   }
 })(typeof window !== 'undefined' ? window : globalThis);

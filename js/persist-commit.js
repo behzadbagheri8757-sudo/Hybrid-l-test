@@ -39,6 +39,8 @@
   let _installed = false;
   /** @type {Function|null} */
   let _originalSaveData = null;
+  let _originalLoadData = null;
+  let _lastPersistedData = null;
   /** stats for tests */
   const _stats = {
     fullWrites: 0,
@@ -116,12 +118,12 @@
   async function saveDataHybridAware() {
     const H = global.BaqeriHybrid;
     if (!H || typeof H.saveDataHybrid !== 'function') {
-      // Fallback to original monolith if hybrid module missing
-      if (_originalSaveData) return _originalSaveData();
-      throw new Error('Hybrid module not available');
+      throw new Error('Hybrid module not available; persistence blocked');
     }
 
-    // Ensure schema stamp
+    // Global safety net: every legacy mutation path gets an automatic RAM
+    // snapshot, so a persistence failure cannot leave RAM ahead of disk.
+    const previousData = deepClone(global.data);
     if (global.data) {
       global.data.schemaVersion = H.HYBRID_SCHEMA || global.data.schemaVersion;
     }
@@ -129,48 +131,83 @@
     const hint = _hint;
     _hint = null; // consume once
 
-    if (hint && hint.length) {
-      H.clearDirty();
-      for (let i = 0; i < hint.length; i++) {
-        if (hint[i] === '__meta__') H.markDirty('invoiceSeq');
-        else H.markDirty(hint[i]);
+    try {
+      if (hint && hint.length) {
+        H.clearDirty();
+        for (let i = 0; i < hint.length; i++) {
+          if (hint[i] === '__meta__') H.markDirty('invoiceSeq');
+          else H.markDirty(hint[i]);
+        }
+        _stats.selectiveWrites++;
+        _stats.lastMode = 'selective';
+      } else {
+        H.markAllDirty();
+        _stats.fullWrites++;
+        _stats.lastMode = 'full';
       }
-      // Always include meta when invoiceSeq might change is caller's job;
-      // selective path only writes marked keys.
-      _stats.selectiveWrites++;
-      _stats.lastMode = 'selective';
-    } else {
-      // SAFE FALLBACK: full write — no silent data loss
-      H.markAllDirty();
-      _stats.fullWrites++;
-      _stats.lastMode = 'full';
-    }
 
-    const result = await H.saveDataHybrid(global.data);
-    _stats.lastWrote = (result && result.wrote) || [];
-    _stats.lastBytes = (result && result.bytes) || 0;
-    if (result && result.skipped) _stats.skippedEmpty++;
+      const result = await H.saveDataHybrid(global.data);
+      _stats.lastWrote = (result && result.wrote) || [];
+      _stats.lastBytes = (result && result.bytes) || 0;
+      if (result && result.skipped) _stats.skippedEmpty++;
+      _lastPersistedData = deepClone(global.data);
 
-    // Keep auto-backup behavior if available (fire-and-forget, same as production)
-    if (typeof global.autoBackupTick === 'function') {
-      global.autoBackupTick().catch(function (e) {
-        console.error('auto backup failed', e);
-      });
+      if (typeof global.autoBackupTick === 'function') {
+        global.autoBackupTick().catch(function (e) {
+          console.error('auto backup failed', e);
+        });
+      }
+      return result;
+    } catch (e) {
+      global.data = _lastPersistedData ? deepClone(_lastPersistedData) : previousData;
+      H.clearDirty();
+      _hint = null;
+      throw e;
     }
-    return result;
+  }
+
+  function isInstalled() { return _installed; }
+
+  async function getCurrentSnapshot() {
+    if (!_installed) return deepClone(global.data);
+    return deepClone(global.data);
+  }
+
+  function backupKey(name) {
+    return (global.BaqeriHybrid.HYBRID_BACKUP_PREFIX || '__backup__:') + name;
+  }
+
+  async function persistenceGet(name) {
+    if (_installed && global.BaqeriHybrid && typeof global.BaqeriHybrid.hybridGetValue === 'function') {
+      return global.BaqeriHybrid.hybridGetValue(backupKey(name));
+    }
+    return global.dbGet(name);
+  }
+
+  async function persistencePut(name, value) {
+    if (_installed && global.BaqeriHybrid && typeof global.BaqeriHybrid.hybridPutValue === 'function') {
+      return global.BaqeriHybrid.hybridPutValue(backupKey(name), value);
+    }
+    return global.dbPut(name, value);
+  }
+
+  async function persistenceDelete(name) {
+    if (_installed && global.BaqeriHybrid && typeof global.BaqeriHybrid.hybridDeleteValue === 'function') {
+      return global.BaqeriHybrid.hybridDeleteValue(backupKey(name));
+    }
+    return global.dbDelete(name);
   }
 
   /**
-   * Install experimental persist: replaces global saveData.
-   * loadData is NOT replaced here — use loadDataHybrid + assign to data separately,
-   * or installExperimentalLoad().
+   * Install experimental persist: replaces both saveData and loadData so Hybrid
+   * is a complete persistence backend rather than a write-only side path.
    */
   function installExperimentalPersist() {
     if (_installed) return;
-    if (typeof global.saveData === 'function') {
-      _originalSaveData = global.saveData;
-    }
+    if (typeof global.saveData === 'function') _originalSaveData = global.saveData;
+    if (typeof global.loadData === 'function') _originalLoadData = global.loadData;
     global.saveData = saveDataHybridAware;
+    global.loadData = loadDataHybridAware;
     global.__persistHint = __persistHint;
     global.clearPersistHint = clearPersistHint;
     global.commitMutation = commitMutation;
@@ -181,8 +218,12 @@
   function uninstallExperimentalPersist() {
     if (!_installed) return;
     if (_originalSaveData) global.saveData = _originalSaveData;
+    if (_originalLoadData) global.loadData = _originalLoadData;
     _installed = false;
     _hint = null;
+    _originalSaveData = null;
+    _originalLoadData = null;
+    _lastPersistedData = null;
   }
 
   /**
@@ -198,6 +239,7 @@
       d = global.normalizeData(d);
     }
     global.data = d;
+    _lastPersistedData = deepClone(d);
     return d;
   }
 
@@ -231,6 +273,11 @@
     uninstallExperimentalPersist,
     loadDataHybridAware,
     saveDataHybridAware,
+    isInstalled,
+    getCurrentSnapshot,
+    persistenceGet,
+    persistencePut,
+    persistenceDelete,
     getStats: function () {
       return {
         fullWrites: _stats.fullWrites,

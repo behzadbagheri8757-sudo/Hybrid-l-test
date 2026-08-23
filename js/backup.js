@@ -80,186 +80,273 @@ function prospectBackupDelete(db, storeName, key){
   });
 }
 
-/** خواندن بسته‌ی Prospect برای Backup — در صورت نبود DB یا خطا null */
+/** Read the complete ProspectScout bundle. Any failure is fatal to a Full Backup. */
 async function exportProspectScoutBundle(){
+  const db = await openProspectScoutDbForBackup();
   try{
-    const db = await openProspectScoutDbForBackup();
     const shops = await prospectBackupGetAll(db, 'shops');
     const routes = await prospectBackupGetAll(db, 'routes');
     const dtRec = await prospectBackupGet(db, 'meta', 'dailyTarget');
-    try{ db.close(); }catch(e){}
     return {
       version: 1,
       shops: shops || [],
       routes: routes || [],
-      dailyTarget: (dtRec && dtRec.value) ? dtRec.value : null,
+      dailyTarget: dtRec && Object.prototype.hasOwnProperty.call(dtRec, 'value') ? dtRec.value : null,
     };
-  }catch(e){
-    console.error('exportProspectScoutBundle failed', e);
-    return null;
+  } finally {
+    try{ db.close(); }catch(e){}
   }
 }
 
-/** جایگزینی کامل داده‌ی Prospect از bundle بکاپ — فقط وقتی bundle معتبر است */
+/** Replace shops/routes/meta in ONE ProspectScout transaction. */
+async function restoreProspectScoutBundleInDb(db, bundle){
+  if(!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) throw new Error('Invalid ProspectScout bundle');
+  if(bundle.version !== 1 || !Array.isArray(bundle.shops) || !Array.isArray(bundle.routes)) throw new Error('Invalid ProspectScout bundle schema');
+  return new Promise((resolve,reject)=>{
+    let tx;
+    try { tx = db.transaction(['shops','routes','meta'], 'readwrite'); } catch(e){ reject(e); return; }
+    const shops = tx.objectStore('shops');
+    const routes = tx.objectStore('routes');
+    const meta = tx.objectStore('meta');
+    let oldShops = null, oldRoutes = null, queued = false;
+    const fail = e => { try{ tx.abort(); }catch(_){} reject(e || new Error('Prospect restore failed')); };
+    const queueReplacement = () => {
+      if(queued || !oldShops || !oldRoutes) return;
+      queued = true;
+      try{
+        for(const row of oldShops) shops.delete(row.id);
+        for(const row of oldRoutes) routes.delete(row.id);
+        for(const row of bundle.shops) shops.put(row);
+        for(const row of bundle.routes) routes.put(row);
+        if(bundle.dailyTarget == null) meta.delete('dailyTarget');
+        else meta.put({key:'dailyTarget', value:bundle.dailyTarget});
+      }catch(e){ fail(e); }
+    };
+    const a = shops.getAll();
+    a.onsuccess = () => { oldShops = a.result || []; queueReplacement(); };
+    a.onerror = () => fail(a.error);
+    const b = routes.getAll();
+    b.onsuccess = () => { oldRoutes = b.result || []; queueReplacement(); };
+    b.onerror = () => fail(b.error);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('Prospect restore transaction failed'));
+    tx.onabort = () => reject(tx.error || new Error('Prospect restore transaction aborted'));
+  });
+}
+
+/** Replace ProspectScout data; errors propagate to the caller. */
 async function restoreProspectScoutBundle(bundle){
-  if(!bundle || typeof bundle !== 'object') return false;
-  if(!Array.isArray(bundle.shops) && !Array.isArray(bundle.routes) && bundle.dailyTarget == null) return false;
+  const db = await openProspectScoutDbForBackup();
   try{
-    const db = await openProspectScoutDbForBackup();
-    const oldShops = await prospectBackupGetAll(db, 'shops');
-    const oldRoutes = await prospectBackupGetAll(db, 'routes');
-    for(const s of (oldShops||[])) await prospectBackupDelete(db, 'shops', s.id);
-    for(const r of (oldRoutes||[])) await prospectBackupDelete(db, 'routes', r.id);
-    for(const s of (bundle.shops||[])) await prospectBackupPut(db, 'shops', s);
-    for(const r of (bundle.routes||[])) await prospectBackupPut(db, 'routes', r);
-    if(bundle.dailyTarget != null){
-      await prospectBackupPut(db, 'meta', {key:'dailyTarget', value: bundle.dailyTarget});
-    }
+    return await restoreProspectScoutBundleInDb(db, bundle);
+  } finally {
     try{ db.close(); }catch(e){}
-    return true;
-  }catch(e){
-    console.error('restoreProspectScoutBundle failed', e);
-    return false;
   }
+}
+
+function assertKnownKeys(obj, allowed, path){
+  if(!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error(path+' must be an object');
+  for(const k of Object.keys(obj)) if(!allowed.has(k)) throw new Error(path+'.'+k+' is unknown');
+}
+function assertString(v, path, required){ if(v==null && !required) return; if(typeof v!=='string') throw new Error(path+' must be string'); }
+function assertNumber(v, path, required){ if(v==null && !required) return; if(typeof v!=='number' || !Number.isFinite(v)) throw new Error(path+' must be finite number'); }
+function assertBoolean(v, path, required){ if(v==null && !required) return; if(typeof v!=='boolean') throw new Error(path+' must be boolean'); }
+function assertArray(v, path){ if(!Array.isArray(v)) throw new Error(path+' must be array'); }
+function assertIdObject(o, path){ assertString(o.id, path+'.id', true); }
+
+function validateBackupDeep(parsed){
+  if(!parsed || typeof parsed!=='object' || Array.isArray(parsed)) throw new Error('backup root must be object');
+  const topAllowed = new Set(['schemaVersion','invoiceSeq','products','customers','invoices','payments','checks','suppliers','inventoryLayers','prospectScout']);
+  assertKnownKeys(parsed, topAllowed, 'backup');
+  for(const k of ['products','customers','invoices','payments','checks','suppliers','inventoryLayers']) assertArray(parsed[k], k);
+  if(parsed.schemaVersion!=null) assertNumber(parsed.schemaVersion,'schemaVersion',false);
+  if(parsed.invoiceSeq!=null) assertNumber(parsed.invoiceSeq,'invoiceSeq',false);
+
+  parsed.products.forEach((p,i)=>{
+    const path='products['+i+']'; assertKnownKeys(p,new Set(['id','name','category','packageWeight','buy','wholesale','retail','sell','stockQty','minStock','priceHistory','stockLog','active']),path); assertIdObject(p,path);
+    for(const k of ['name','category']) assertString(p[k],path+'.'+k,true);
+    for(const k of ['packageWeight','buy','wholesale','retail','sell','stockQty','minStock']) assertNumber(p[k],path+'.'+k,true);
+    assertArray(p.priceHistory,path+'.priceHistory'); assertArray(p.stockLog,path+'.stockLog'); assertBoolean(p.active,path+'.active',true);
+    p.priceHistory.forEach((h,j)=>{ const q=path+'.priceHistory['+j+']'; assertKnownKeys(h,new Set(['date','buy','wholesale','retail']),q); assertString(h.date,q+'.date',true); for(const k of ['buy','wholesale','retail']) assertNumber(h[k],q+'.'+k,true); });
+    p.stockLog.forEach((l,j)=>{ const q=path+'.stockLog['+j+']'; assertKnownKeys(l,new Set(['id','date','type','qty','note','purchaseId','paymentId','invoiceId']),q); assertIdObject(l,q); assertString(l.date,q+'.date',true); assertString(l.type,q+'.type',true); assertNumber(l.qty,q+'.qty',true); if(l.note!=null) assertString(l.note,q+'.note',false); for(const k of ['purchaseId','paymentId','invoiceId']) if(l[k]!=null) assertString(l[k],q+'.'+k,false); });
+  });
+
+  parsed.customers.forEach((c,i)=>{
+    const path='customers['+i+']'; assertKnownKeys(c,new Set(['id','name','ownerName','phone','address','region','route','note','openingBalance','visits','active']),path); assertIdObject(c,path);
+    for(const k of ['name','ownerName','phone','address','region','route','note']) assertString(c[k],path+'.'+k,true); assertNumber(c.openingBalance,path+'.openingBalance',true); assertArray(c.visits,path+'.visits'); assertBoolean(c.active,path+'.active',true);
+    c.visits.forEach((v,j)=>{ const q=path+'.visits['+j+']'; assertKnownKeys(v,new Set(['id','date','time','result','ordered','reason','opportunity','threat','nextAction','note','tags']),q); assertIdObject(v,q); assertString(v.date,q+'.date',true); for(const k of ['time','result','reason','opportunity','threat','nextAction','note']) if(v[k]!=null) assertString(v[k],q+'.'+k,false); if(v.ordered!=null) assertBoolean(v.ordered,q+'.ordered',false); if(v.tags!=null){ assertArray(v.tags,q+'.tags'); v.tags.forEach((t,z)=>assertString(t,q+'.tags['+z+']',true)); } });
+  });
+
+  parsed.invoices.forEach((inv,i)=>{
+    const path='invoices['+i+']'; assertKnownKeys(inv,new Set(['id','number','customerId','date','items','total','discount','discountType','prevBalance','cashPaid','checkPaid','cardPaid','transferPaid','newBalance','editHistory']),path); assertIdObject(inv,path); assertNumber(inv.number,path+'.number',false); assertString(inv.customerId,path+'.customerId',true); assertString(inv.date,path+'.date',true); assertArray(inv.items,path+'.items');
+    for(const k of ['total','discount','prevBalance','cashPaid','checkPaid','cardPaid','transferPaid','newBalance']) assertNumber(inv[k],path+'.'+k,false); if(inv.discountType!=null) assertString(inv.discountType,path+'.discountType',false); assertArray(inv.editHistory,path+'.editHistory');
+    inv.items.forEach((it,j)=>{ const q=path+'.items['+j+']'; assertKnownKeys(it,new Set(['productId','name','qty','price','buyPrice','discount','weight','costAllocations','cogs']),q); assertString(it.productId,q+'.productId',true); assertString(it.name,q+'.name',true); for(const k of ['qty','price','buyPrice','discount','weight','cogs']) assertNumber(it[k],q+'.'+k,false); if(it.costAllocations!=null){ assertArray(it.costAllocations,q+'.costAllocations'); it.costAllocations.forEach((a,z)=>{ const r=q+'.costAllocations['+z+']'; assertKnownKeys(a,new Set(['layerId','qty','unitCost','cost','emergency']),r); if(a.layerId!=null) assertString(a.layerId,r+'.layerId',false); for(const k of ['qty','unitCost','cost']) assertNumber(a[k],r+'.'+k,true); if(a.emergency!=null) assertBoolean(a.emergency,r+'.emergency',false); }); } });
+    inv.editHistory.forEach((h,j)=>{ const q=path+'.editHistory['+j+']'; if(!h || typeof h!=='object' || Array.isArray(h)) throw new Error(q+' must be object'); });
+  });
+
+  parsed.payments.forEach((p,i)=>{ const path='payments['+i+']'; assertKnownKeys(p,new Set(['id','customerId','date','amount','method','invoiceId','note','returnItems']),path); assertIdObject(p,path); assertString(p.customerId,path+'.customerId',true); assertString(p.date,path+'.date',true); assertNumber(p.amount,path+'.amount',true); assertString(p.method,path+'.method',true); if(p.invoiceId!=null) assertString(p.invoiceId,path+'.invoiceId',false); if(p.note!=null) assertString(p.note,path+'.note',false); assertArray(p.returnItems,path+'.returnItems'); p.returnItems.forEach((ri,j)=>{ const q=path+'.returnItems['+j+']'; assertKnownKeys(ri,new Set(['productId','name','qty','price','unitCost','max']),q); assertString(ri.productId,q+'.productId',true); if(ri.name!=null) assertString(ri.name,q+'.name',false); for(const k of ['qty','price','unitCost','max']) assertNumber(ri[k],q+'.'+k,false); }); });
+  parsed.checks.forEach((c,i)=>{ const path='checks['+i+']'; assertKnownKeys(c,new Set(['id','customerId','amount','dueDate','checkNumber','status','invoiceId']),path); assertIdObject(c,path); assertString(c.customerId,path+'.customerId',true); assertNumber(c.amount,path+'.amount',true); assertString(c.dueDate,path+'.dueDate',true); assertString(c.checkNumber,path+'.checkNumber',true); assertString(c.status,path+'.status',true); if(c.invoiceId!=null) assertString(c.invoiceId,path+'.invoiceId',false); });
+  parsed.suppliers.forEach((s,i)=>{ const path='suppliers['+i+']'; assertKnownKeys(s,new Set(['id','name','phone','openingBalance','active','purchases','payments']),path); assertIdObject(s,path); assertString(s.name,path+'.name',true); assertString(s.phone,path+'.phone',true); assertNumber(s.openingBalance,path+'.openingBalance',true); assertBoolean(s.active,path+'.active',true); assertArray(s.purchases,path+'.purchases'); assertArray(s.payments,path+'.payments');
+    s.purchases.forEach((pu,j)=>{ const q=path+'.purchases['+j+']'; assertKnownKeys(pu,new Set(['id','date','amount','desc','productId','qty','items','returns']),q); assertIdObject(pu,q); assertString(pu.date,q+'.date',true); assertNumber(pu.amount,q+'.amount',true); assertString(pu.desc,q+'.desc',true); assertString(pu.productId,q+'.productId',true); assertNumber(pu.qty,q+'.qty',true); if(pu.items!=null){ assertArray(pu.items,q+'.items'); pu.items.forEach((it,z)=>{ const r=q+'.items['+z+']'; assertKnownKeys(it,new Set(['id','productId','name','qty','unitCost','lineAmount']),r); assertIdObject(it,r); assertString(it.productId,r+'.productId',true); assertString(it.name,r+'.name',true); for(const k of ['qty','unitCost','lineAmount']) assertNumber(it[k],r+'.'+k,true); }); } assertArray(pu.returns,q+'.returns'); pu.returns.forEach((ret,z)=>{ const r=q+'.returns['+z+']'; assertKnownKeys(ret,new Set(['id','date','qty','amount','items']),r); assertIdObject(ret,r); assertString(ret.date,r+'.date',true); assertNumber(ret.qty,r+'.qty',true); assertNumber(ret.amount,r+'.amount',true); if(ret.items!=null){ assertArray(ret.items,r+'.items'); ret.items.forEach((x,w)=>{ const t=r+'.items['+w+']'; assertKnownKeys(x,new Set(['itemId','productId','qty','amount']),t); if(x.itemId!=null) assertString(x.itemId,t+'.itemId',false); assertString(x.productId,t+'.productId',true); assertNumber(x.qty,t+'.qty',true); assertNumber(x.amount,t+'.amount',true); }); } }); });
+    s.payments.forEach((pay,j)=>{ const q=path+'.payments['+j+']'; if(!pay || typeof pay!=='object' || Array.isArray(pay)) throw new Error(q+' must be object'); assertKnownKeys(pay,new Set(['id','date','amount','method','note','faceAmount','checkNumber','bank','issueDate','dueDate','status']),q); if(pay.id!=null) assertString(pay.id,q+'.id',false); assertString(pay.date,q+'.date',true); assertNumber(pay.amount,q+'.amount',true); if(pay.method!=null) assertString(pay.method,q+'.method',false); for(const k of ['note','checkNumber','bank','issueDate','dueDate','status']) if(pay[k]!=null) assertString(pay[k],q+'.'+k,false); if(pay.faceAmount!=null) assertNumber(pay.faceAmount,q+'.faceAmount',false); });
+  });
+  parsed.inventoryLayers.forEach((l,i)=>{ const path='inventoryLayers['+i+']'; assertKnownKeys(l,new Set(['id','purchaseId','productId','itemId','qtyOriginal','qtyRemaining','unitCost','status','source','date','note']),path); assertIdObject(l,path); if(l.purchaseId!=null) assertString(l.purchaseId,path+'.purchaseId',false); assertString(l.productId,path+'.productId',true); if(l.itemId!=null) assertString(l.itemId,path+'.itemId',false); for(const k of ['qtyOriginal','qtyRemaining','unitCost']) assertNumber(l[k],path+'.'+k,true); assertString(l.status,path+'.status',true); assertString(l.source,path+'.source',true); if(l.date!=null) assertString(l.date,path+'.date',false); if(l.note!=null) assertString(l.note,path+'.note',false); });
+
+  if(parsed.prospectScout!=null){
+    const b=parsed.prospectScout; assertKnownKeys(b,new Set(['version','shops','routes','dailyTarget']),'prospectScout'); if(b.version!==1) throw new Error('prospectScout.version invalid'); assertArray(b.shops,'prospectScout.shops'); assertArray(b.routes,'prospectScout.routes');
+    b.shops.forEach((sh,i)=>{ const q='prospectScout.shops['+i+']'; assertKnownKeys(sh,new Set(['id','schemaVersion','name','routeId','neighborhoodId','status','linkedCustomerId','createdAt','updatedAt','latestScore','latestRank','visits']),q); assertIdObject(sh,q); assertNumber(sh.schemaVersion,q+'.schemaVersion',true); assertString(sh.name,q+'.name',true); for(const k of ['routeId','neighborhoodId','linkedCustomerId']) if(sh[k]!=null) assertString(sh[k],q+'.'+k,false); assertString(sh.status,q+'.status',true); assertString(sh.createdAt,q+'.createdAt',true); assertString(sh.updatedAt,q+'.updatedAt',true); assertNumber(sh.latestScore,q+'.latestScore',true); assertString(sh.latestRank,q+'.latestRank',true); assertArray(sh.visits,q+'.visits'); sh.visits.forEach((v,j)=>{ const r=q+'.visits['+j+']'; assertKnownKeys(v,new Set(['id','date','answers','score','rank','scoringVersion','tags']),r); assertIdObject(v,r); assertString(v.date,r+'.date',true); if(!v.answers || typeof v.answers!=='object' || Array.isArray(v.answers)) throw new Error(r+'.answers must be object'); assertNumber(v.score,r+'.score',true); assertString(v.rank,r+'.rank',true); assertNumber(v.scoringVersion,r+'.scoringVersion',true); assertArray(v.tags,r+'.tags'); v.tags.forEach((t,z)=>assertString(t,r+'.tags['+z+']',true)); }); });
+    b.routes.forEach((rt,i)=>{ const q='prospectScout.routes['+i+']'; assertKnownKeys(rt,new Set(['id','schemaVersion','name','createdAt','neighborhoods']),q); assertIdObject(rt,q); assertNumber(rt.schemaVersion,q+'.schemaVersion',true); assertString(rt.name,q+'.name',true); assertString(rt.createdAt,q+'.createdAt',true); assertArray(rt.neighborhoods,q+'.neighborhoods'); rt.neighborhoods.forEach((n,j)=>{ const r=q+'.neighborhoods['+j+']'; assertKnownKeys(n,new Set(['id','name']),r); assertIdObject(n,r); assertString(n.name,r+'.name',true); }); });
+    if(b.dailyTarget!=null) assertNumber(b.dailyTarget,'prospectScout.dailyTarget',false);
+  } else throw new Error('prospectScout bundle missing — Full Backup requires both databases');
+  return true;
+}
+
+function validateBackupShape(parsed){
+  try { validateBackupDeep(parsed); return true; } catch(e) { return false; }
+}
+if(typeof globalThis!=='undefined') globalThis.__validateBackupShape = validateBackupShape;
+if(typeof globalThis!=='undefined') globalThis.__validateBackupDeep = validateBackupDeep;
+if(typeof globalThis!=='undefined') globalThis.__restoreProspectScoutBundleInDb = restoreProspectScoutBundleInDb;
+
+function backupPersistence() {
+  if (window.BaqeriPersistCommit && typeof window.BaqeriPersistCommit.isInstalled === 'function' && window.BaqeriPersistCommit.isInstalled()) {
+    return window.BaqeriPersistCommit;
+  }
+  return null;
+}
+
+async function crmPersistenceGet(key) {
+  const p = backupPersistence();
+  return p ? p.persistenceGet(key) : dbGet(key);
+}
+async function crmPersistencePut(key, value) {
+  const p = backupPersistence();
+  return p ? p.persistencePut(key, value) : dbPut(key, value);
+}
+async function crmPersistenceDelete(key) {
+  const p = backupPersistence();
+  return p ? p.persistenceDelete(key) : dbDelete(key);
 }
 
 async function exportBackupJSON(){
   const stamp = todayISO();
-  // سازگاری: همان فیلدهای data در ریشه؛ prospectScout اختیاری و اضافه
   const payload = JSON.parse(JSON.stringify(data));
   const prospect = await exportProspectScoutBundle();
-  if(prospect) payload.prospectScout = prospect;
+  if(!prospect) throw new Error('ProspectScout backup unavailable');
+  payload.prospectScout = prospect;
+  validateBackupDeep(payload);
   await downloadFile(`baqeri-backup-${stamp}.json`, JSON.stringify(payload, null, 2), 'application/json');
-  showToast('فایل بکاپ آماده شد');
+  showToast('فایل بکاپ کامل آماده شد');
 }
 
-function validateBackupShape(parsed){
-  if(!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-  const arrays = ['products','customers','invoices','payments','checks','suppliers'];
-  // FIX (independent audit, round 2): require ALL six known arrays to be
-  // present — not just "at least one" (previous FIX 2) or "undefined is ok"
-  // (original code). Every real backup produced by this app — old or new —
-  // always includes all six as arrays (even empty ones), because emptyData()
-  // and normalizeData() always populate them before export. So a real backup
-  // still passes, while a JSON missing a whole section (e.g. no "invoices"
-  // key at all) is now correctly rejected instead of silently wiping that
-  // section to [] on restore.
-  return arrays.every(k => Array.isArray(parsed[k]));
+async function restoreCrmAndProspectAtomically(previousData, previousProspect, parsed){
+  let crmChanged = false;
+  let prospectChanged = false;
+  try{
+    data = normalizeData(parsed);
+    await saveData();
+    crmChanged = true;
+    await restoreProspectScoutBundle(parsed.prospectScout);
+    prospectChanged = true;
+  }catch(e){
+    // Compensating rollback across the two independent IndexedDB databases.
+    // Each side is atomic internally; cross-DB consistency is restored by
+    // restoring the other side before reporting failure.
+    try{
+      if(crmChanged){ data = previousData; await saveData(); }
+    }catch(rollbackErr){ console.error('CRM restore rollback failed', rollbackErr); }
+    try{
+      if(prospectChanged || crmChanged){ await restoreProspectScoutBundle(previousProspect); }
+    }catch(rollbackErr){ console.error('Prospect restore rollback failed', rollbackErr); }
+    data = previousData;
+    throw e;
+  }
+  return true;
 }
 
 async function importBackupJSON(file){
   try{
     const text = await file.text();
     const parsed = JSON.parse(text);
-    if(!validateBackupShape(parsed)){
-      showToast('این فایل، فایل بکاپ معتبری نیست');
-      return;
-    }
-    // safety net: keep a snapshot of what's about to be overwritten
-    await dbPut(PRERESTORE_KEY, JSON.stringify(data));
-    // اسنپ‌شات Prospect فعلی برای Undo (حتی اگر فایل بکاپ Prospect نداشته باشد)
-    try{
-      const pSnap = await exportProspectScoutBundle();
-      if(pSnap) await dbPut(PRERESTORE_PROSPECT_KEY, JSON.stringify(pSnap));
-    }catch(e){ console.error('prospect pre-restore snapshot failed', e); }
-
-    // FIX 4: keep the previous in-memory data so a failed save doesn't leave
-    // the app running on an unsaved/half-applied dataset.
-    const previousData = data;
-    data = normalizeData(parsed);
-    try{
-      await saveData();
-    }catch(saveErr){
-      data = previousData;
-      throw saveErr;
-    }
-    // فقط اگر بکاپ جدید شامل prospectScout باشد جایگزین می‌شود؛ بکاپ قدیمی Prospect فعلی را دست نمی‌زند
-    if(parsed.prospectScout){
-      await restoreProspectScoutBundle(parsed.prospectScout);
-    }
+    try{ validateBackupDeep(parsed); }catch(validationErr){ showToast('این فایل بکاپ معتبر نیست: '+validationErr.message); return; }
+    const previousData = JSON.parse(JSON.stringify(data));
+    const previousProspect = await exportProspectScoutBundle();
+    await crmPersistencePut(PRERESTORE_KEY, JSON.stringify(previousData));
+    await crmPersistencePut(PRERESTORE_PROSPECT_KEY, JSON.stringify(previousProspect));
+    await restoreCrmAndProspectAtomically(previousData, previousProspect, parsed);
     render();
-    showToast('اطلاعات با موفقیت بازیابی شد');
+    showToast('اطلاعات CRM و ProspectScout با موفقیت بازیابی شد');
   }catch(e){
     console.error(e);
-    showToast('فایل بکاپ معتبر نیست یا خراب است');
+    showToast('بازیابی انجام نشد؛ اطلاعات قبلی حفظ شد');
   }
 }
 
 async function undoLastRestore(){
   try{
-    const snap = await dbGet(PRERESTORE_KEY);
-    if(!snap || !snap.value){ showToast('نسخه‌ی قبل از بازیابی موجود نیست'); return; }
-    // FIX 4: keep the previous in-memory data so a failed save doesn't leave
-    // the app running on an unsaved/half-applied dataset.
-    const previousData = data;
-    data = normalizeData(JSON.parse(snap.value));
-    try{
-      await saveData();
-    }catch(saveErr){
-      data = previousData;
-      throw saveErr;
-    }
-    // FIX 3: the snapshot has now been successfully consumed — invalidate it so
-    // it can't remain permanently reusable / silently reapplied months later.
-    // Only removed AFTER a successful save (a failed save keeps it for recovery).
-    try{ await dbDelete(PRERESTORE_KEY); }catch(e){ console.error('pre-restore snapshot cleanup failed', e); }
-    try{
-      const pSnap = await dbGet(PRERESTORE_PROSPECT_KEY);
-      if(pSnap && pSnap.value){
-        await restoreProspectScoutBundle(JSON.parse(pSnap.value));
-      }
-    }catch(e){ console.error('prospect undo restore failed', e); }
+    const snap = await crmPersistenceGet(PRERESTORE_KEY);
+    const pSnap = await crmPersistenceGet(PRERESTORE_PROSPECT_KEY);
+    if(!snap || !snap.value || !pSnap || !pSnap.value){ showToast('نسخه‌ی کامل قبل از بازیابی موجود نیست'); return; }
+    const previousData = JSON.parse(JSON.stringify(data));
+    const targetData = JSON.parse(snap.value);
+    const targetProspect = JSON.parse(pSnap.value);
+    validateBackupDeep(Object.assign({}, targetData, {prospectScout: targetProspect}));
+    await restoreCrmAndProspectAtomically(previousData, await exportProspectScoutBundle(), Object.assign({}, targetData, {prospectScout: targetProspect}));
+    try{ await crmPersistenceDelete(PRERESTORE_KEY); await crmPersistenceDelete(PRERESTORE_PROSPECT_KEY); }catch(e){ console.error('pre-restore snapshot cleanup failed', e); }
     render();
     showToast('به حالت قبل از بازیابی برگشت');
   }catch(e){
     console.error(e);
-    showToast('بازگرداندن ممکن نشد');
+    showToast('بازگرداندن ممکن نشد؛ اطلاعات فعلی حفظ شد');
   }
 }
 
-// ---------- بکاپ خودکار ساده (fire-and-forget، هیچ‌وقت نباید جلوی ذخیره‌ی اصلی را بگیرد) ----------
+// ---------- Local recovery snapshot (CRM + ProspectScout) ----------
 async function getAutoBackupList(){
-  const rec = await dbGet(AUTO_BACKUP_LIST_KEY);
-  return (rec && rec.value) ? JSON.parse(rec.value) : [];
+  const rec = await crmPersistenceGet(AUTO_BACKUP_LIST_KEY);
+  if(!rec || !rec.value) return [];
+  const list = JSON.parse(rec.value);
+  if(!Array.isArray(list)) throw new Error('auto backup list corrupt');
+  return list;
 }
 
 async function autoBackupTick(){
   const list = await getAutoBackupList();
   const last = list.length ? list[list.length-1].ts : 0;
-  if(Date.now() - last < AUTO_BACKUP_INTERVAL_MS) return; // هنوز زوده، لازم نیست نسخه‌ی جدید بگیریم
+  if(Date.now() - last < AUTO_BACKUP_INTERVAL_MS) return;
+  const prospect = await exportProspectScoutBundle();
+  if(!prospect) throw new Error('ProspectScout unavailable; auto backup not created');
+  const snapshot = JSON.parse(JSON.stringify(data));
+  snapshot.prospectScout = prospect;
+  validateBackupDeep(snapshot);
   const ts = Date.now();
   const key = AUTO_BACKUP_PREFIX + ts;
-  await dbPut(key, JSON.stringify(data));
+  await crmPersistencePut(key, JSON.stringify(snapshot));
   list.push({key, ts});
   while(list.length > AUTO_BACKUP_MAX){
     const old = list.shift();
-    try{ await dbDelete(old.key); }catch(e){ /* نبود یا حذف نشد، مهم نیست */ }
+    try{ await crmPersistenceDelete(old.key); }catch(e){ /* retention cleanup only */ }
   }
-  await dbPut(AUTO_BACKUP_LIST_KEY, JSON.stringify(list));
+  await crmPersistencePut(AUTO_BACKUP_LIST_KEY, JSON.stringify(list));
 }
 
 async function restoreFromAutoBackup(key){
-  if(!confirm('مطمئنی؟ اطلاعات فعلی با این نسخه‌ی بکاپ خودکار جایگزین می‌شه.')) return;
+  if(!confirm('مطمئنی؟ اطلاعات فعلی با این نسخه‌ی بازیابی محلی جایگزین می‌شه.')) return;
   try{
-    const snap = await dbGet(key);
+    const snap = await crmPersistenceGet(key);
     if(!snap || !snap.value){ showToast('این نسخه‌ی بکاپ پیدا نشد'); return; }
-    // مثل بازیابی از فایل: قبل از جایگزینی، وضعیت فعلی هم نگه داشته می‌شود
-    await dbPut(PRERESTORE_KEY, JSON.stringify(data));
-    // FIX 4: keep the previous in-memory data so a failed save doesn't leave
-    // the app running on an unsaved/half-applied dataset.
-    const previousData = data;
-    data = normalizeData(JSON.parse(snap.value));
-    try{
-      await saveData();
-    }catch(saveErr){
-      data = previousData;
-      throw saveErr;
-    }
+    const parsed = JSON.parse(snap.value);
+    validateBackupDeep(parsed);
+    const previousData = JSON.parse(JSON.stringify(data));
+    const previousProspect = await exportProspectScoutBundle();
+    await crmPersistencePut(PRERESTORE_KEY, JSON.stringify(previousData));
+    await crmPersistencePut(PRERESTORE_PROSPECT_KEY, JSON.stringify(previousProspect));
+    await restoreCrmAndProspectAtomically(previousData, previousProspect, parsed);
     render();
-    showToast('از بکاپ خودکار بازیابی شد');
+    showToast('بازیابی محلی کامل شد');
   }catch(e){
     console.error(e);
-    showToast('بازیابی از بکاپ خودکار ممکن نشد');
+    showToast('بازیابی محلی انجام نشد؛ اطلاعات قبلی حفظ شد');
   }
 }
 
