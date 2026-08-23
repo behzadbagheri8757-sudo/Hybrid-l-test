@@ -18,9 +18,6 @@ const HYBRID_META_KEY = '__meta__';
 const HYBRID_SCHEMA = 4;
 const HYBRID_INIT_KEY = '__hybrid_init__';
 const HYBRID_BACKUP_PREFIX = '__backup__:';
-const HYBRID_OWNER_KEY = '__hybrid_owner__';
-const HYBRID_OWNER_LEASE_MS = 15000;
-const HYBRID_OWNER_HEARTBEAT_MS = 5000;
 
 const COLLECTION_KEYS = [
   'products',
@@ -37,8 +34,6 @@ const META_SCALAR_KEYS = ['invoiceSeq', 'schemaVersion'];
 // ---------- dirty tracking ----------
 const _dirty = Object.create(null);
 let _hybridDb = null;
-let _ownerToken = null;
-let _ownerHeartbeat = null;
 
 // ---------- memory backend (Node tests / no IndexedDB) ----------
 let _useMemory = typeof indexedDB === 'undefined';
@@ -99,137 +94,6 @@ function getDirtySnapshot() {
     if (_dirty[k]) out.push(k);
   });
   return out;
-}
-
-
-function makeOwnerToken() {
-  return String(Date.now()) + '-' + Math.random().toString(36).slice(2) + '-' + Math.random().toString(36).slice(2);
-}
-
-function ownerIsFresh(owner) {
-  return !!(owner && typeof owner === 'object' && owner.expiresAt > Date.now());
-}
-
-async function acquireHybridOwner() {
-  if (_ownerToken) return true;
-  const token = makeOwnerToken();
-  const now = Date.now();
-  if (_useMemory) {
-    const current = _memoryStore[HYBRID_OWNER_KEY] ? JSON.parse(_memoryStore[HYBRID_OWNER_KEY]) : null;
-    if (ownerIsFresh(current) && current.token !== token) return false;
-    _memoryStore[HYBRID_OWNER_KEY] = JSON.stringify({ token: token, acquiredAt: now, expiresAt: now + HYBRID_OWNER_LEASE_MS });
-    _ownerToken = token;
-    startOwnerHeartbeat();
-    return true;
-  }
-  const db = await getHybridDB();
-  const acquired = await new Promise(function(resolve, reject) {
-    const tx = db.transaction(HYBRID_STORE, 'readwrite');
-    const store = tx.objectStore(HYBRID_STORE);
-    let ok = false;
-    let owner = null;
-    const getReq = store.get(HYBRID_OWNER_KEY);
-    getReq.onsuccess = function() {
-      owner = getReq.result ? (function(){ try { return JSON.parse(getReq.result.value); } catch(e){ return null; } })() : null;
-      if (ownerIsFresh(owner)) return;
-      const next = { token: token, acquiredAt: now, expiresAt: now + HYBRID_OWNER_LEASE_MS };
-      store.put({ key: HYBRID_OWNER_KEY, value: JSON.stringify(next) });
-      ok = true;
-    };
-    getReq.onerror = function(e){ try{ tx.abort(); }catch(_){} reject(e.target.error); };
-    tx.oncomplete = function(){ resolve(ok); };
-    tx.onerror = function(e){ reject(e.target.error || new Error('owner transaction failed')); };
-    tx.onabort = function(e){ if(!ok) resolve(false); else reject((e && e.target && e.target.error) || new Error('owner transaction aborted')); };
-  });
-  if (!acquired) return false;
-  _ownerToken = token;
-  startOwnerHeartbeat();
-  return true;
-}
-
-async function refreshHybridOwner() {
-  if (!_ownerToken) return false;
-  const now = Date.now();
-  if (_useMemory) {
-    const raw = _memoryStore[HYBRID_OWNER_KEY];
-    if (!raw) return false;
-    let owner; try { owner = JSON.parse(raw); } catch(e) { return false; }
-    if (owner.token !== _ownerToken) return false;
-    owner.expiresAt = now + HYBRID_OWNER_LEASE_MS;
-    _memoryStore[HYBRID_OWNER_KEY] = JSON.stringify(owner);
-    return true;
-  }
-  const db = await getHybridDB();
-  return new Promise(function(resolve, reject){
-    const tx = db.transaction(HYBRID_STORE, 'readwrite');
-    const store = tx.objectStore(HYBRID_STORE);
-    const req = store.get(HYBRID_OWNER_KEY);
-    let ok = false;
-    req.onsuccess = function(){
-      let owner = null;
-      try { owner = req.result ? JSON.parse(req.result.value) : null; } catch(e) { owner = null; }
-      if(!owner || owner.token !== _ownerToken || !ownerIsFresh(owner)){ try{tx.abort();}catch(_){} return; }
-      owner.expiresAt = now + HYBRID_OWNER_LEASE_MS;
-      store.put({key:HYBRID_OWNER_KEY,value:JSON.stringify(owner)});
-      ok = true;
-    };
-    req.onerror = function(e){ try{tx.abort();}catch(_){} reject(e.target.error); };
-    tx.oncomplete = function(){ resolve(ok); };
-    tx.onerror = function(e){ reject(e.target.error || new Error('owner refresh failed')); };
-    tx.onabort = function(){ if(!ok) resolve(false); };
-  });
-}
-
-function startOwnerHeartbeat() {
-  if (_ownerHeartbeat || typeof setInterval !== 'function') return;
-  _ownerHeartbeat = setInterval(function(){
-    refreshHybridOwner().catch(function(){ /* save path re-validates ownership */ });
-  }, HYBRID_OWNER_HEARTBEAT_MS);
-  if (_ownerHeartbeat && typeof _ownerHeartbeat.unref === 'function') _ownerHeartbeat.unref();
-}
-
-function stopOwnerHeartbeat() {
-  if (_ownerHeartbeat && typeof clearInterval === 'function') clearInterval(_ownerHeartbeat);
-  _ownerHeartbeat = null;
-}
-
-async function assertHybridOwner() {
-  if (!_ownerToken) throw new Error('Hybrid persistence owner is not acquired');
-  const ok = await refreshHybridOwner();
-  if (!ok) throw new Error('Hybrid persistence owner lost; write blocked to prevent stale overwrite');
-  return true;
-}
-
-async function releaseHybridOwner() {
-  if (!_ownerToken) return;
-  const token = _ownerToken;
-  _ownerToken = null;
-  stopOwnerHeartbeat();
-  if (_useMemory) {
-    const raw = _memoryStore[HYBRID_OWNER_KEY];
-    if (raw) { try { const owner = JSON.parse(raw); if(owner.token === token) delete _memoryStore[HYBRID_OWNER_KEY]; } catch(e){} }
-    return;
-  }
-  try {
-    const db = await getHybridDB();
-    await new Promise(function(resolve, reject){
-      const tx = db.transaction(HYBRID_STORE, 'readwrite');
-      const store = tx.objectStore(HYBRID_STORE);
-      const req = store.get(HYBRID_OWNER_KEY);
-      req.onsuccess = function(){
-        let owner=null; try{ owner=req.result?JSON.parse(req.result.value):null; }catch(e){}
-        if(owner && owner.token===token) store.delete(HYBRID_OWNER_KEY);
-      };
-      req.onerror = function(e){ reject(e.target.error); };
-      tx.oncomplete = resolve;
-      tx.onerror = function(e){ reject(e.target.error); };
-      tx.onabort = function(e){ reject((e&&e.target&&e.target.error)||new Error('owner release aborted')); };
-    });
-  } catch(e) { /* expiry protects future writers */ }
-}
-
-function getOwnerStatus() {
-  return { owned: !!_ownerToken, token: _ownerToken ? 'held' : null };
 }
 
 // ---------- IndexedDB ----------
@@ -407,40 +271,8 @@ async function loadDataHybrid() {
  * @param {{ forceFull?: boolean }} [opts]
  *   forceFull: mark all dirty before write (safe path)
  */
-
-function hybridPutManyOwned(db, entries, ownerToken) {
-  if (_useMemory) {
-    const raw = _memoryStore[HYBRID_OWNER_KEY];
-    let owner = null; try { owner = raw ? JSON.parse(raw) : null; } catch(e) {}
-    if (!owner || owner.token !== ownerToken || !ownerIsFresh(owner)) return Promise.reject(new Error('Hybrid persistence owner lost; write blocked'));
-    owner.expiresAt = Date.now() + HYBRID_OWNER_LEASE_MS;
-    _memoryStore[HYBRID_OWNER_KEY] = JSON.stringify(owner);
-    for (let i = 0; i < entries.length; i++) _memoryStore[entries[i].key] = entries[i].value;
-    return Promise.resolve();
-  }
-  return new Promise(function(resolve, reject) {
-    const tx = db.transaction(HYBRID_STORE, 'readwrite');
-    const store = tx.objectStore(HYBRID_STORE);
-    let allowed = false;
-    const ownerReq = store.get(HYBRID_OWNER_KEY);
-    ownerReq.onsuccess = function() {
-      let owner = null; try { owner = ownerReq.result ? JSON.parse(ownerReq.result.value) : null; } catch(e) {}
-      if (!owner || owner.token !== ownerToken || !ownerIsFresh(owner)) { try { tx.abort(); } catch(_) {} return; }
-      owner.expiresAt = Date.now() + HYBRID_OWNER_LEASE_MS;
-      store.put({ key: HYBRID_OWNER_KEY, value: JSON.stringify(owner) });
-      for (let i = 0; i < entries.length; i++) store.put({ key: entries[i].key, value: entries[i].value });
-      allowed = true;
-    };
-    ownerReq.onerror = function(e){ try{tx.abort();}catch(_){} reject(e.target.error); };
-    tx.oncomplete = function(){ if(allowed) resolve(); else reject(new Error('Hybrid persistence owner lost; write blocked')); };
-    tx.onerror = function(e){ reject(e.target.error || new Error('Hybrid write transaction failed')); };
-    tx.onabort = function(e){ reject((e && e.target && e.target.error) || new Error('Hybrid write transaction aborted')); };
-  });
-}
-
 async function saveDataHybrid(dataObj, opts) {
   if (!dataObj) throw new Error('saveDataHybrid: no data');
-  await assertHybridOwner();
   for (let i = 0; i < COLLECTION_KEYS.length; i++) {
     const k = COLLECTION_KEYS[i];
     if (!Array.isArray(dataObj[k])) {
@@ -484,7 +316,7 @@ async function saveDataHybrid(dataObj, opts) {
   }
 
   try {
-    await hybridPutManyOwned(db, entries, _ownerToken);
+    await hybridPutMany(db, entries);
   } catch (e) {
     // Do NOT clear dirty on failure — caller may retry; in-memory data still current
     throw e;
@@ -555,12 +387,6 @@ const api = {
   _testDelete: function (key) { if (!_useMemory) throw new Error('test delete requires memory backend'); delete _memoryStore[key]; },
   openHybridDB: openHybridDB,
   getHybridDB: getHybridDB,
-  acquireHybridOwner: acquireHybridOwner,
-  refreshHybridOwner: refreshHybridOwner,
-  releaseHybridOwner: releaseHybridOwner,
-  assertHybridOwner: assertHybridOwner,
-  getOwnerStatus: getOwnerStatus,
-  HYBRID_OWNER_KEY: HYBRID_OWNER_KEY,
 };
 
 if (typeof globalThis !== 'undefined') {

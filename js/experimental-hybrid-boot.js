@@ -1,56 +1,31 @@
-/* experimental-hybrid-boot.js
- *
- * Hybrid persistence is enabled by default.
- * The legacy ?hybrid=1 / ?experimentalHybrid=1 parameters are retained for
- * backward compatibility but no longer control activation.
- *
- * Hybrid initialization is fail-closed: initialization failure never falls
- * back silently to the monolithic persistence path.
- */
+/* experimental-hybrid-boot.js — Hybrid default-on activation boundary */
 (function (global) {
   'use strict';
 
   function isHybridOptIn() {
-    // Legacy activation parameters are intentionally accepted but no longer
-    // required: Hybrid is always enabled.
+    // Backward-compatible API name; Hybrid is now always enabled.
     return true;
   }
 
   function banner(msg) {
-    try {
-      console.info('%c[Experimental Hybrid] ' + msg, 'color:#c60;font-weight:bold');
-    } catch (e) {}
+    try { console.info('%c[Hybrid] ' + msg, 'color:#276;font-weight:bold'); } catch (e) {}
   }
 
-  /**
-   * Call after db-hybrid.js + persist-commit.js are loaded, and ideally
-   * before the first loadData/saveData during app boot.
-   * Hybrid is always required; missing modules or initialization failures throw
-   * so callers can fail closed instead of falling back to monolithic persistence.
-   */
+  let _readyPromise = null;
+
   async function maybeInstallExperimentalHybrid() {
     if (!global.BaqeriHybrid) {
-      throw new Error('Hybrid persistence unavailable: load js/db-hybrid.js first');
+      throw new Error('Hybrid persistence module is not loaded');
     }
     if (!global.BaqeriPersistCommit) {
-      throw new Error('Hybrid persistence unavailable: load js/persist-commit.js first');
+      throw new Error('Hybrid persistence commit module is not loaded');
     }
+
+    const H = global.BaqeriHybrid;
+    const C = global.BaqeriPersistCommit;
+
     try {
-      const H = global.BaqeriHybrid;
-      const C = global.BaqeriPersistCommit;
-
-      // Hybrid is single-writer. A second tab may read, but it must never be
-      // allowed to persist a stale RAM snapshot over the current owner.
-      const ownsPersistence = await H.acquireHybridOwner();
-      if (!ownsPersistence) {
-        global.BaqeriExperimentalHybridReadOnly = true;
-        banner('SECOND INSTANCE — read-only mode; Hybrid writes are blocked');
-      } else {
-        global.BaqeriExperimentalHybridReadOnly = false;
-      }
-
-      // First activation: migrate the existing monolithic snapshot exactly once.
-      // Existing Hybrid data is authoritative; never silently fall back to monolith.
+      // Existing Hybrid data is authoritative. Only migrate when Hybrid is empty.
       const hasHybrid = await H.hybridHasAnyData();
       if (!hasHybrid) {
         let source = null;
@@ -59,32 +34,36 @@
           if (rec && rec.value) source = JSON.parse(rec.value);
         }
         if (!source && typeof global.data !== 'undefined') source = global.data;
-        if (typeof global.normalizeData === 'function') source = global.normalizeData(source || global.emptyData());
+        if (typeof global.normalizeData === 'function') {
+          source = global.normalizeData(source || global.emptyData());
+        }
         await H.migrateFromMonolithPayload(source || global.data);
         banner('first activation — monolith snapshot migrated to Hybrid DB');
       }
 
+      // Critical ordering: install the Hybrid load/save replacements BEFORE any
+      // application load or user mutation can occur.
       C.installExperimentalPersist();
-      // installExperimentalPersist replaces both saveData and loadData.
-      // Fail closed if the Hybrid store is incomplete/corrupt.
       await C.loadDataHybridAware();
 
-      banner('ENABLED — load/save/backup use Hybrid collections (DB: ' +
-        (H.HYBRID_DB_NAME || 'baqeriDB_experimental') + ')');
+      banner('READY — Hybrid persistence active');
       return true;
     } catch (e) {
-      banner('install failed: ' + (e && e.message ? e.message : e));
+      banner('BOOT FAILED — Hybrid persistence not installed: ' + (e && e.message ? e.message : e));
       throw e;
     }
+  }
+
+  function ensureReady() {
+    if (!_readyPromise) _readyPromise = maybeInstallExperimentalHybrid();
+    return _readyPromise;
   }
 
   global.BaqeriExperimentalHybridBoot = {
     isHybridOptIn: isHybridOptIn,
     maybeInstallExperimentalHybrid: maybeInstallExperimentalHybrid,
-    isReadOnly: function(){ return global.BaqeriExperimentalHybridReadOnly === true; },
+    ensureReady: ensureReady,
+    // Kept for compatibility; activation is lazy and starts when bootSpaShell awaits ensureReady().
+    get ready() { return ensureReady(); }
   };
-
-  // Auto-run install on every boot. nav.js waits on this promise before the
-  // first loadData(); a rejection is handled as a fail-closed boot failure.
-  global.BaqeriExperimentalHybridBoot.ready = maybeInstallExperimentalHybrid();
 })(typeof window !== 'undefined' ? window : globalThis);

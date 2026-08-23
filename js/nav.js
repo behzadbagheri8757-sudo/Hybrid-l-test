@@ -368,11 +368,10 @@ async function bootPage(activeId, afterLoad){
       document.body.innerHTML = '<div style="padding:24px;text-align:center;font-family:sans-serif;direction:rtl;">خطا در قفل PIN. صفحه را دوباره باز کنید.</div>';
       return;
     }
-    if (window.BaqeriExperimentalHybridBoot && window.BaqeriExperimentalHybridBoot.ready) {
-      var hybridReady = await window.BaqeriExperimentalHybridBoot.ready;
-      if (hybridReady !== true) {
-        throw new Error('Hybrid persistence failed to initialize; refusing monolithic fallback');
-      }
+    if (window.BaqeriExperimentalHybridBoot && typeof window.BaqeriExperimentalHybridBoot.ensureReady === 'function') {
+      await window.BaqeriExperimentalHybridBoot.ensureReady();
+    } else {
+      throw new Error('Hybrid boot boundary is unavailable; refusing monolithic fallback');
     }
     await loadData();
     renderSharedNav(activeId);
@@ -431,11 +430,10 @@ async function bootSpaShell() {
       return;
     }
 
-    if (window.BaqeriExperimentalHybridBoot && window.BaqeriExperimentalHybridBoot.ready) {
-      var hybridReady = await window.BaqeriExperimentalHybridBoot.ready;
-      if (hybridReady !== true) {
-        throw new Error('Hybrid persistence failed to initialize; refusing monolithic fallback');
-      }
+    if (window.BaqeriExperimentalHybridBoot && typeof window.BaqeriExperimentalHybridBoot.ensureReady === 'function') {
+      await window.BaqeriExperimentalHybridBoot.ensureReady();
+    } else {
+      throw new Error('Hybrid boot boundary is unavailable; refusing monolithic fallback');
     }
     await loadData();
 

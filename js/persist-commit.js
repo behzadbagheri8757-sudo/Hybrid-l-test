@@ -40,7 +40,6 @@
   /** @type {Function|null} */
   let _originalSaveData = null;
   let _originalLoadData = null;
-  let _lastPersistedData = null;
   /** stats for tests */
   const _stats = {
     fullWrites: 0,
@@ -118,12 +117,12 @@
   async function saveDataHybridAware() {
     const H = global.BaqeriHybrid;
     if (!H || typeof H.saveDataHybrid !== 'function') {
-      throw new Error('Hybrid module not available; persistence blocked');
+      // Fallback to original monolith if hybrid module missing
+      if (_originalSaveData) return _originalSaveData();
+      throw new Error('Hybrid module not available');
     }
 
-    // Global safety net: every legacy mutation path gets an automatic RAM
-    // snapshot, so a persistence failure cannot leave RAM ahead of disk.
-    const previousData = deepClone(global.data);
+    // Ensure schema stamp
     if (global.data) {
       global.data.schemaVersion = H.HYBRID_SCHEMA || global.data.schemaVersion;
     }
@@ -131,39 +130,35 @@
     const hint = _hint;
     _hint = null; // consume once
 
-    try {
-      if (hint && hint.length) {
-        H.clearDirty();
-        for (let i = 0; i < hint.length; i++) {
-          if (hint[i] === '__meta__') H.markDirty('invoiceSeq');
-          else H.markDirty(hint[i]);
-        }
-        _stats.selectiveWrites++;
-        _stats.lastMode = 'selective';
-      } else {
-        H.markAllDirty();
-        _stats.fullWrites++;
-        _stats.lastMode = 'full';
-      }
-
-      const result = await H.saveDataHybrid(global.data);
-      _stats.lastWrote = (result && result.wrote) || [];
-      _stats.lastBytes = (result && result.bytes) || 0;
-      if (result && result.skipped) _stats.skippedEmpty++;
-      _lastPersistedData = deepClone(global.data);
-
-      if (typeof global.autoBackupTick === 'function') {
-        global.autoBackupTick().catch(function (e) {
-          console.error('auto backup failed', e);
-        });
-      }
-      return result;
-    } catch (e) {
-      global.data = _lastPersistedData ? deepClone(_lastPersistedData) : previousData;
+    if (hint && hint.length) {
       H.clearDirty();
-      _hint = null;
-      throw e;
+      for (let i = 0; i < hint.length; i++) {
+        if (hint[i] === '__meta__') H.markDirty('invoiceSeq');
+        else H.markDirty(hint[i]);
+      }
+      // Always include meta when invoiceSeq might change is caller's job;
+      // selective path only writes marked keys.
+      _stats.selectiveWrites++;
+      _stats.lastMode = 'selective';
+    } else {
+      // SAFE FALLBACK: full write — no silent data loss
+      H.markAllDirty();
+      _stats.fullWrites++;
+      _stats.lastMode = 'full';
     }
+
+    const result = await H.saveDataHybrid(global.data);
+    _stats.lastWrote = (result && result.wrote) || [];
+    _stats.lastBytes = (result && result.bytes) || 0;
+    if (result && result.skipped) _stats.skippedEmpty++;
+
+    // Keep auto-backup behavior if available (fire-and-forget, same as production)
+    if (typeof global.autoBackupTick === 'function') {
+      global.autoBackupTick().catch(function (e) {
+        console.error('auto backup failed', e);
+      });
+    }
+    return result;
   }
 
   function isInstalled() { return _installed; }
@@ -223,7 +218,6 @@
     _hint = null;
     _originalSaveData = null;
     _originalLoadData = null;
-    _lastPersistedData = null;
   }
 
   /**
@@ -239,7 +233,6 @@
       d = global.normalizeData(d);
     }
     global.data = d;
-    _lastPersistedData = deepClone(d);
     return d;
   }
 
