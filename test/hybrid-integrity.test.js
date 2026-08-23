@@ -27,8 +27,10 @@ const results = [];
 
 function test(name, fn) {
   return Promise.resolve()
-    .then(function () {
+    .then(async function () {
+      await H.releaseHybridOwner();
       H.memoryClear();
+      await H.acquireHybridOwner();
       H.clearDirty();
       C.resetStats();
       globalThis.data = {
@@ -133,6 +135,8 @@ async function run() {
 
   await test('invoice-set multi-collection single transaction batch', async function () {
     globalThis.data = emptyData();
+    H.markAllDirty();
+    await H.saveDataHybrid(globalThis.data);
     globalThis.data.invoices.push({ id: 'i1', total: 100 });
     globalThis.data.payments.push({ id: 'p1', amount: 10 });
     globalThis.data.products.push({ id: 'pr1', stockQty: 5 });
@@ -161,65 +165,26 @@ async function run() {
   });
 
   // --- corrupt / missing recovery ---
-  await test('missing collection loads as empty array', async function () {
+  await test('missing collection fails closed instead of silently resetting', async function () {
     globalThis.data = emptyData();
-    globalThis.data.payments.push({ id: 'p1', amount: 1 });
-    H.clearDirty();
-    H.markDirty('payments');
-    H.markDirty('invoiceSeq');
+    H.markAllDirty();
     await H.saveDataHybrid(globalThis.data);
-
-    const loaded = await H.loadDataHybrid();
-    assert.strictEqual(Array.isArray(loaded.customers), true);
-    assert.strictEqual(loaded.customers.length, 0);
-    assert.strictEqual(loaded.payments.length, 1);
+    if (typeof H._testDelete === 'function') H._testDelete('customers');
+    let threw = false;
+    try { await H.loadDataHybrid(); } catch (e) { threw = true; }
+    assert.strictEqual(threw, true);
   });
 
-  await test('corrupt collection JSON resets that collection only', async function () {
+  await test('corrupt collection JSON fails closed without resetting it', async function () {
     globalThis.data = emptyData();
     globalThis.data.customers.push({ id: 'c1', name: 'X' });
     globalThis.data.payments.push({ id: 'p1', amount: 9 });
     H.markAllDirty();
     await H.saveDataHybrid(globalThis.data);
-
-    // corrupt payments in memory store
-    const mem = require(hybridPath); // already loaded
-    // access via re-save simulation: inject bad value
-    H.useMemoryBackend(true);
-    // direct poke through save path with invalid by using internal memory
-    // We use markDirty + force by writing bad string via hybrid API simulation:
-    await H.saveDataHybrid(globalThis.data, { forceFull: true });
-    // Manually break payments key using memoryClear partial — re-implement poke:
-    // export doesn't expose memory store; use migrate then override by second process.
-    // Instead: save good, then call load after we put bad JSON via markDirty path.
-    // Poke: use saveDataHybrid after temporarily replacing payments serializer — simpler:
-    const badData = emptyData();
-    badData.customers = globalThis.data.customers;
-    // Write good customers, then inject corrupt payments string using low-level:
-    // We'll use markAllDirty on object and then overwrite _memoryStore if available.
-    // Since _memoryStore is not exported, simulate by:
-    // 1) save payments as valid
-    // 2) load
-    // 3) for unit test of safeParseArray, call load after forcing corrupt via save of non-array
-    // Actually saveDataHybrid always JSON.stringify(array). So inject after save:
-    // Require and eval a small poke — use memory backend put through save of wrong type by hacking data:
-    // Save payments as [] then use migrateFromMonolith with only customers - not enough.
-
-    // Direct test of recovery function path: write corrupt using internal by
-    // requiring and setting through save with a stub — skip if not exposed.
-    // Alternative: test safe behavior by writing empty payments and ensuring customers survive.
-    const loaded = await H.loadDataHybrid();
-    assert.strictEqual(loaded.customers.length, 1);
-    assert.strictEqual(loaded.payments.length, 1);
-
-    // Explicitly test safeParse by writing non-array via force path:
-    // We add a test-only poke on H if available
-    if (typeof H._testPoke === 'function') {
-      H._testPoke('payments', '{not json');
-      const l2 = await H.loadDataHybrid();
-      assert.strictEqual(l2.payments.length, 0);
-      assert.strictEqual(l2.customers.length, 1);
-    }
+    H._testPoke('payments', '{not json');
+    let threw = false;
+    try { await H.loadDataHybrid(); } catch (e) { threw = true; }
+    assert.strictEqual(threw, true);
   });
 
   // --- failed transaction keeps previous persisted state ---
@@ -361,7 +326,9 @@ async function run() {
     snapshot.invoiceSeq = 1100;
     snapshot.schemaVersion = 3;
 
+    await H.releaseHybridOwner();
     H.memoryClear();
+    await H.acquireHybridOwner();
     await H.migrateFromMonolithPayload(snapshot);
     const loaded = await H.loadDataHybrid();
     assert.strictEqual(loaded.products.length, 1);
@@ -378,6 +345,8 @@ async function run() {
   // --- repeated save/load cycles ---
   await test('repeated save/load cycles preserve data', async function () {
     globalThis.data = emptyData();
+    H.markAllDirty();
+    await H.saveDataHybrid(globalThis.data);
     for (let i = 0; i < 20; i++) {
       globalThis.data.payments.push({ id: 'p' + i, amount: i });
       H.clearDirty();

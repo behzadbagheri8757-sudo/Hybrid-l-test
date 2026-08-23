@@ -22,8 +22,10 @@ let failed = 0;
 
 function test(name, fn) {
   return Promise.resolve()
-    .then(function () {
+    .then(async function () {
+      await H.releaseHybridOwner();
       H.memoryClear();
+      await H.acquireHybridOwner();
       H.clearDirty();
       C.resetStats();
       globalThis.data = emptyData();
@@ -418,7 +420,9 @@ async function run() {
       schemaVersion: 3, // classic export stamps production-compatible version for interchange
     };
     // Clean second DB
+    await H.releaseHybridOwner();
     H.memoryClear();
+    await H.acquireHybridOwner();
     await H.migrateFromMonolithPayload(exported);
     const loaded2 = await H.loadDataHybrid();
     assert.strictEqual(businessFingerprint(loaded2), businessFingerprint(snap));
@@ -442,6 +446,31 @@ async function run() {
     assert.ok(threw);
     const loaded = await H.loadDataHybrid();
     assert.strictEqual(businessFingerprint(loaded), businessFingerprint(good));
+  });
+
+  await test('C4: installed Hybrid replaces BOTH loadData and saveData and exposes backup storage adapter', async function () {
+    const originalLoad = async function () { return 'monolith'; };
+    const originalSave = async function () { return 'monolith-save'; };
+    globalThis.loadData = originalLoad;
+    globalThis.saveData = originalSave;
+    globalThis.data = makeProductionSnapshot();
+    H.markAllDirty();
+    await H.saveDataHybrid(globalThis.data);
+    C.installExperimentalPersist();
+    assert.notStrictEqual(globalThis.loadData, originalLoad);
+    assert.notStrictEqual(globalThis.saveData, originalSave);
+    globalThis.data = emptyData();
+    await globalThis.loadData();
+    assert.strictEqual(globalThis.data.customers.length, 1);
+    assert.strictEqual(globalThis.data.invoices.length, 1);
+    await C.persistencePut('preRestoreSnapshot', JSON.stringify({ marker: 'hybrid' }));
+    const rec = await C.persistenceGet('preRestoreSnapshot');
+    assert.strictEqual(rec && JSON.parse(rec.value).marker, 'hybrid');
+    await C.persistenceDelete('preRestoreSnapshot');
+    assert.strictEqual(await C.persistenceGet('preRestoreSnapshot'), null);
+    C.uninstallExperimentalPersist();
+    assert.strictEqual(globalThis.loadData, originalLoad);
+    assert.strictEqual(globalThis.saveData, originalSave);
   });
 
   // ---- wiring status self-check (opt-in only; no silent install) ----
