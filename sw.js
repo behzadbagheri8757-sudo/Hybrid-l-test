@@ -7,7 +7,7 @@
  */
 'use strict';
 
-const CACHE_NAME = 'baqeri-shell-v16';
+const CACHE_NAME = 'baqeri-shell-v17';
 
 /** App Shell — paths relative to this SW (same directory as index.html). */
 const PRECACHE_URLS = [
@@ -16,6 +16,9 @@ const PRECACHE_URLS = [
   './js/models.js',
   './js/ui.js',
   './js/db.js',
+  './js/db-hybrid.js',
+  './js/persist-commit.js',
+  './js/experimental-hybrid-boot.js',
   './js/calc.js',
   './js/stock.js',
   './js/payments.js',
@@ -61,6 +64,9 @@ const CRITICAL_SHELLS = [
   './index.html',
   './css/app.css',
   './js/db.js',
+  './js/db-hybrid.js',
+  './js/persist-commit.js',
+  './js/experimental-hybrid-boot.js',
   './js/nav.js',
   './js/app.js',
   './js/models.js',

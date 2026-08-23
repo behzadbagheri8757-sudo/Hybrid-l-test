@@ -1,12 +1,13 @@
 {
   "name": "baqeri-hybrid-experimental",
-  "version": "0.1.0-experimental",
+  "version": "0.2.0-experimental",
   "private": true,
   "description": "Experimental Hybrid persistence for Baqeri CRM — NOT Production Freeze",
   "scripts": {
-    "test": "node test/hybrid-integrity.test.js && node test/final-validation.test.js",
+    "test": "node test/hybrid-integrity.test.js && node test/final-validation.test.js && node test/blocker-validation.test.js",
     "test:integrity": "node test/hybrid-integrity.test.js",
     "test:final": "node test/final-validation.test.js",
+    "test:blockers": "node test/blocker-validation.test.js",
     "serve": "npx --yes serve -p 4173 ."
   },
   "engines": {
