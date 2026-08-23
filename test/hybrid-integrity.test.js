@@ -27,10 +27,8 @@ const results = [];
 
 function test(name, fn) {
   return Promise.resolve()
-    .then(async function () {
-      await H.releaseHybridOwner();
+    .then(function () {
       H.memoryClear();
-      await H.acquireHybridOwner();
       H.clearDirty();
       C.resetStats();
       globalThis.data = {
@@ -326,9 +324,7 @@ async function run() {
     snapshot.invoiceSeq = 1100;
     snapshot.schemaVersion = 3;
 
-    await H.releaseHybridOwner();
     H.memoryClear();
-    await H.acquireHybridOwner();
     await H.migrateFromMonolithPayload(snapshot);
     const loaded = await H.loadDataHybrid();
     assert.strictEqual(loaded.products.length, 1);

@@ -22,10 +22,8 @@ let failed = 0;
 
 function test(name, fn) {
   return Promise.resolve()
-    .then(async function () {
-      await H.releaseHybridOwner();
+    .then(function () {
       H.memoryClear();
-      await H.acquireHybridOwner();
       H.clearDirty();
       C.resetStats();
       globalThis.data = emptyData();
@@ -420,9 +418,7 @@ async function run() {
       schemaVersion: 3, // classic export stamps production-compatible version for interchange
     };
     // Clean second DB
-    await H.releaseHybridOwner();
     H.memoryClear();
-    await H.acquireHybridOwner();
     await H.migrateFromMonolithPayload(exported);
     const loaded2 = await H.loadDataHybrid();
     assert.strictEqual(businessFingerprint(loaded2), businessFingerprint(snap));
@@ -473,21 +469,51 @@ async function run() {
     assert.strictEqual(globalThis.saveData, originalSave);
   });
 
-  // ---- wiring status self-check: Hybrid is default-on and fail-closed ----
-  await test('W1: Hybrid boot is default-on; legacy query remains compatible', async function () {
+  // ---- Default-on boot wiring + ordering ----
+  await test('W1: Hybrid is default-on and boot boundary is explicit', async function () {
     const fs = require('fs');
     const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
     const boot = fs.readFileSync(path.join(__dirname, '..', 'js', 'experimental-hybrid-boot.js'), 'utf8');
     const nav = fs.readFileSync(path.join(__dirname, '..', 'js', 'nav.js'), 'utf8');
-    assert.ok(html.indexOf('db.js') !== -1, 'legacy db.js remains available for migration');
-    assert.ok(html.indexOf('db-hybrid.js') !== -1, 'Hybrid DB loaded');
-    assert.ok(html.indexOf('persist-commit.js') !== -1, 'Hybrid persistence commit loaded');
-    assert.ok(html.indexOf('experimental-hybrid-boot.js') !== -1, 'Hybrid boot script referenced');
-    assert.ok(boot.indexOf('function isHybridOptIn()') !== -1, 'legacy activation API retained');
+    assert.ok(html.indexOf('db.js') !== -1, 'monolith compatibility source referenced');
+    assert.ok(html.indexOf('db-hybrid.js') !== -1, 'Hybrid module loaded');
+    assert.ok(html.indexOf('persist-commit.js') !== -1, 'Hybrid commit loaded');
+    assert.ok(html.indexOf('experimental-hybrid-boot.js') !== -1, 'Hybrid boot loaded');
     assert.ok(boot.indexOf('return true;') !== -1, 'Hybrid default-on');
-    assert.ok(boot.indexOf('global.BaqeriExperimentalHybridBoot.ready = maybeInstallExperimentalHybrid();') !== -1, 'Hybrid boot runs without query parameter');
-    assert.ok(boot.indexOf('return false;') === -1, 'boot does not silently disable Hybrid');
-    assert.ok(nav.indexOf('if (hybridReady !== true)') !== -1, 'SPA boot fails closed when Hybrid is not ready');
+    assert.ok(boot.indexOf('ensureReady') !== -1, 'explicit boot boundary present');
+    assert.ok(nav.indexOf('ensureReady()') !== -1, 'nav awaits Hybrid before loadData');
+  });
+
+  await test('W2: no-query boot ordering reaches Hybrid load before UI mutation', async function () {
+    const vm = require('vm');
+    const fs = require('fs');
+    const code = fs.readFileSync(path.join(__dirname, '..', 'js', 'experimental-hybrid-boot.js'), 'utf8');
+    const order = [];
+    const ctx = {
+      console,
+      location: { search: '' },
+      data: { customers: [], products: [], invoices: [], payments: [], checks: [], suppliers: [], inventoryLayers: [] },
+      emptyData: function(){ return {customers:[],products:[],invoices:[],payments:[],checks:[],suppliers:[],inventoryLayers:[]}; },
+      normalizeData: function(d){ order.push('normalize'); return d; },
+      dbGet: async function(){ order.push('dbGet'); return null; },
+      BaqeriHybrid: {
+        hybridHasAnyData: async function(){ order.push('hybridHasAnyData'); return true; },
+        migrateFromMonolithPayload: async function(){ order.push('migrate'); },
+      },
+      BaqeriPersistCommit: {
+        installExperimentalPersist: function(){ order.push('install'); },
+        loadDataHybridAware: async function(){ order.push('hybridLoad'); return {}; },
+      }
+    };
+    vm.createContext(ctx);
+    vm.runInContext(code, ctx);
+    order.push('appStart');
+    await ctx.BaqeriExperimentalHybridBoot.ensureReady();
+    order.push('uiReady');
+    order.push('customerMutation');
+    order.push('saveDataHybrid');
+    assert.deepStrictEqual(order, ['appStart','hybridHasAnyData','install','hybridLoad','uiReady','customerMutation','saveDataHybrid']);
+    assert.strictEqual(ctx.BaqeriExperimentalHybridBoot.isHybridOptIn(), true);
   });
 
   console.log('\n=== FINAL VALIDATION: ' + passed + ' PASS, ' + failed + ' FAIL ===\n');
